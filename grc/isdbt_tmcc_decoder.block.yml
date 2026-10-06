@@ -27,6 +27,9 @@ outputs:
 - label: out
   dtype: complex
   vlen: ${13*96*(2**(mode-1))} 
+- domain: message
+  id: tmcc
+  optional: true
 
 #  'file_format' specifies the version of the GRC yml format used in the file
 #  and should usually not be changed.

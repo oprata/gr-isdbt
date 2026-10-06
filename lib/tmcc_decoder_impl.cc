@@ -34,6 +34,7 @@
 #include <gnuradio/io_signature.h>
 #include "tmcc_decoder_impl.h"
 #include <cmath>
+#include <string>
 
 namespace gr {
     namespace isdbt {
@@ -484,6 +485,81 @@ namespace gr {
             }
 
         /*
+         * Publishes the current TMCC parameters (ARIB STD-B31) as a PMT dictionary
+         * on the "tmcc" message port. Called once per received ISDB-T frame.
+         *
+         * Keys:
+         *   valid               (bool)  parity check result
+         *   mode                (long)  1, 2 or 3 (as configured in this block)
+         *   system_id           (long)  B20-B21
+         *   switching_indicator (long)  B22-B25 (15 = no change announced)
+         *   emergency_alarm     (bool)  B26 (EWS)
+         *   partial_reception   (bool)  B27 (one-seg present)
+         *   For L in {A, B, C}:
+         *   L_present           (bool)
+         *   L_segments          (long)  0 if layer not present
+         *   L_constellation     (long)  4, 16, 64 (0 if not present / DQPSK)
+         *   L_rate              (long)  0=1/2 1=2/3 2=3/4 3=5/6 4=7/8 (viterbi_decoder 'rate')
+         *   L_interleaving      (long)  I value for this mode (time_deinterleaver 'length')
+         */
+        void
+            tmcc_decoder_impl::publish_tmcc(bool valid)
+            {
+                pmt::pmt_t dict = pmt::make_dict();
+                dict = pmt::dict_add(dict, pmt::mp("valid"), pmt::from_bool(valid));
+                dict = pmt::dict_add(dict, pmt::mp("mode"), pmt::from_long(d_mode));
+
+                if (valid)
+                {
+                    // I value per mode, indexed by the 3-bit interleaving field (0..3)
+                    static const int i_table[3][4] = { {0, 4, 8, 16},   // mode 1
+                                                       {0, 2, 4, 8},    // mode 2
+                                                       {0, 1, 2, 4} };  // mode 3
+
+                    // Reads n bits starting at TMCC bit 'first' (MSB first)
+                    auto bits = [this](int first, int n) {
+                        int v = 0;
+                        for (int k = 0; k < n; k++)
+                            v = (v << 1) | (d_rcv_tmcc_data[first + k] & 1);
+                        return v;
+                    };
+
+                    dict = pmt::dict_add(dict, pmt::mp("system_id"), pmt::from_long(bits(20, 2)));
+                    dict = pmt::dict_add(dict, pmt::mp("switching_indicator"), pmt::from_long(bits(22, 4)));
+                    dict = pmt::dict_add(dict, pmt::mp("emergency_alarm"), pmt::from_bool(bits(26, 1) != 0));
+                    dict = pmt::dict_add(dict, pmt::mp("partial_reception"), pmt::from_bool(bits(27, 1) != 0));
+
+                    const char * names[3] = {"A", "B", "C"};
+                    const int offsets[3] = {28, 41, 54};
+
+                    for (int l = 0; l < 3; l++)
+                    {
+                        const int off = offsets[l];
+                        const int mod = bits(off, 3);       // 1=QPSK 2=16QAM 3=64QAM 0=DQPSK 7=unused
+                        const int rate = bits(off + 3, 3);  // 0..4, 7=unused
+                        const int il = bits(off + 6, 3);    // 0..3, 7=unused
+                        const int seg = bits(off + 9, 4);   // 1..13, 15=unused
+
+                        const bool present = (seg >= 1 && seg <= 13) &&
+                                             (mod >= 1 && mod <= 3) &&
+                                             (rate <= 4) && (il <= 3);
+
+                        const int constellation = present ? (mod == 1 ? 4 : (mod == 2 ? 16 : 64)) : 0;
+                        const int interleaving = (present && d_mode >= 1 && d_mode <= 3) ? i_table[d_mode - 1][il] : 0;
+
+                        const std::string p(names[l]);
+                        dict = pmt::dict_add(dict, pmt::mp(p + "_present"), pmt::from_bool(present));
+                        dict = pmt::dict_add(dict, pmt::mp(p + "_segments"), pmt::from_long(present ? seg : 0));
+                        dict = pmt::dict_add(dict, pmt::mp(p + "_constellation"), pmt::from_long(constellation));
+                        dict = pmt::dict_add(dict, pmt::mp(p + "_rate"), pmt::from_long(present ? rate : 0));
+                        dict = pmt::dict_add(dict, pmt::mp(p + "_interleaving"), pmt::from_long(interleaving));
+                    }
+                }
+
+                message_port_pub(pmt::mp("tmcc"), dict);
+            }
+
+        /*
          * The aim of this method is to 1) decode the TMCC carriers and 2) detect the end of a frame indicated 
          * by the complete reception of the TMCC. 
          */
@@ -563,10 +639,12 @@ namespace gr {
                             {
                                 tmcc_print();
                             }
+                            publish_tmcc(true);
                             printf("TMCC OK\n"); 
                         }
                         else
                         {
+                            publish_tmcc(false);
                             printf("TMCC NOT OK\n");
                             //if (d_print_params)
                             //{
@@ -613,6 +691,9 @@ namespace gr {
             construct_data_carriers_list(); 
 
             d_print_params = print_params; 
+
+            d_mode = mode;
+            message_port_register_out(pmt::mp("tmcc"));
 
             // We allocate memory for d_prev_tmcc_symbol attribute
             d_prev_tmcc_symbol = new gr_complex[tmcc_carriers_size];

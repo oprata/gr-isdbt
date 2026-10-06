@@ -138,6 +138,13 @@ namespace gr {
                 // how many symbols ago we saw a complete tmcc
                 int d_since_last_tmcc;
 
+                // Transmission mode (1, 2 or 3), needed to translate the
+                // interleaving length index into the actual I value
+                int d_mode;
+
+                // Publishes the decoded TMCC parameters on the "tmcc" message port
+                void publish_tmcc(bool valid);
+
                 // a list of the data carriers for the current configuration (mode), one 
                 // list per symbol. 
                 int * d_data_carriers; 
