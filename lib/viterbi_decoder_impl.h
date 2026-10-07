@@ -23,6 +23,7 @@
 #define INCLUDED_ISDBT_VITERBI_DECODER_IMPL_H
 
 #include <isdbt/viterbi_decoder.h>
+#include <gnuradio/attributes.h>
 
 #ifdef DTV_SSE2
 #include <xmmintrin.h>
@@ -64,28 +65,32 @@ namespace gr {
                 static const unsigned char d_puncture_7_8[];
                 static const unsigned char d_Partab[];
 
+                // Decoder state. These used to be 'static' (shared by every
+                // instance): with two decoders running in parallel threads
+                // (layers A and B) they corrupted each other's metrics and
+                // traceback memory. They are now per-instance.
 #ifdef DTV_SSE2
-                static __m128i d_metric0[4];
-                static __m128i d_metric1[4];
-                static __m128i d_path0[4];
-                static __m128i d_path1[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_metric0[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_metric1[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_path0[4];
+                __GR_ATTR_ALIGNED(16) __m128i d_path1[4];
 #else
-                static unsigned char d_metric0_generic[64];
-                static unsigned char d_metric1_generic[64];
-                static unsigned char d_path0_generic[64];
-                static unsigned char d_path1_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_metric0_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_metric1_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_path0_generic[64];
+                __GR_ATTR_ALIGNED(16) unsigned char d_path1_generic[64];
 #endif
 
 #ifdef DTV_SSE2
-                static branchtab27 Branchtab27_sse2[2];
+                __GR_ATTR_ALIGNED(16) branchtab27 Branchtab27_sse2[2];
 #else
-                static branchtab27 Branchtab27_generic[2];
+                __GR_ATTR_ALIGNED(16) branchtab27 Branchtab27_generic[2];
 #endif
 
                 // Metrics for each state
-                static unsigned char mmresult[64];
+                __GR_ATTR_ALIGNED(16) unsigned char mmresult[64];
                 // Paths for each state
-                static unsigned char ppresult[TRACEBACK_MAX][64];
+                __GR_ATTR_ALIGNED(16) unsigned char ppresult[TRACEBACK_MAX][64];
 
                 // Current puncturing vector
                 const unsigned char* d_puncture;

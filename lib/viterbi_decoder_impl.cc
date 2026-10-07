@@ -50,27 +50,8 @@ namespace gr {
             0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
         };
 
-#ifdef DTV_SSE2
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_metric0[4];
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_metric1[4];
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_path0[4];
-        __GR_ATTR_ALIGNED(16) __m128i viterbi_decoder_impl::d_path1[4];
-#else
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_metric0_generic[64];
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_metric1_generic[64];
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_path0_generic[64];
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::d_path1_generic[64];
-#endif
-
-#ifdef DTV_SSE2
-        __GR_ATTR_ALIGNED(16) branchtab27 viterbi_decoder_impl::Branchtab27_sse2[2];
-#else
-        __GR_ATTR_ALIGNED(16) branchtab27 viterbi_decoder_impl::Branchtab27_generic[2];
-#endif
-
-        __GR_ATTR_ALIGNED(16) unsigned char viterbi_decoder_impl::mmresult[64];
-        __GR_ATTR_ALIGNED(16)
-            unsigned char viterbi_decoder_impl::ppresult[TRACEBACK_MAX][64];
+        // Decoder state (metrics, paths, branch tables, traceback memory) is now
+        // per-instance; see viterbi_decoder_impl.h.
 
 #ifdef DTV_SSE2
         void viterbi_decoder_impl::viterbi_chunks_init_sse2(__m128i* mm0, __m128i* pp0)
@@ -541,6 +522,7 @@ namespace gr {
                     //d_init(0),
                     //store_pos(0)
                 {
+                    store_pos = 0;
                     // d_k: the input of the encoder
                     // d_n: the output of the encoder
                     // d_puncture: depuncturing matrix
