@@ -78,6 +78,14 @@ namespace gr {
             d_last_ber_out = 0.5;
             d_alpha_avg = 0.001; 
 
+            d_stat_packets = 0;
+            d_stat_corr_packets = 0;
+            d_stat_bytes = 0;
+            d_stat_bits = 0;
+            d_stat_uncorrectable = 0;
+            d_last_publish = std::chrono::steady_clock::now();
+            message_port_register_out(pmt::mp("stats"));
+
         }
 
         /*
@@ -88,6 +96,30 @@ namespace gr {
             free_rs_char(d_rs);
         }
         
+        bool
+            reed_solomon_dec_isdbt_impl::stop()
+            {
+                publish_stats(true);
+                return true;
+            }
+
+        void
+            reed_solomon_dec_isdbt_impl::publish_stats(bool force)
+            {
+                const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+                if (!force && now - d_last_publish < std::chrono::milliseconds(500))
+                    return;
+                d_last_publish = now;
+
+                pmt::pmt_t dict = pmt::make_dict();
+                dict = pmt::dict_add(dict, pmt::mp("packets"), pmt::from_uint64(d_stat_packets));
+                dict = pmt::dict_add(dict, pmt::mp("corrected_packets"), pmt::from_uint64(d_stat_corr_packets));
+                dict = pmt::dict_add(dict, pmt::mp("corrected_bytes"), pmt::from_uint64(d_stat_bytes));
+                dict = pmt::dict_add(dict, pmt::mp("corrected_bits"), pmt::from_uint64(d_stat_bits));
+                dict = pmt::dict_add(dict, pmt::mp("uncorrectable"), pmt::from_uint64(d_stat_uncorrectable));
+                message_port_pub(pmt::mp("stats"), dict);
+            }
+
         void
             reed_solomon_dec_isdbt_impl::forecast (int noutput_items, gr_vector_int &ninput_items_required)
             {
@@ -98,7 +130,7 @@ namespace gr {
             }
 
         int
-            reed_solomon_dec_isdbt_impl::decode (unsigned char &out, const unsigned char &in)
+            reed_solomon_dec_isdbt_impl::decode (unsigned char &out, const unsigned char &in, int &bits_corrected)
             {
                 unsigned char tmp[d_N];
                 int ncorrections;
@@ -109,6 +141,15 @@ namespace gr {
 
                 // correct message...
                 ncorrections = decode_rs_char(d_rs, tmp, 0, 0);
+
+                // exact number of corrected bits in the 204-byte packet
+                bits_corrected = 0;
+                if (ncorrections > 0)
+                {
+                    const unsigned char * rx = &in;
+                    for (int b = 0; b < (d_n - d_s); b++)
+                        bits_corrected += __builtin_popcount((unsigned int)(rx[b] ^ tmp[d_s + b]));
+                }
 
                 // copy corrected message to output, skipping prefix zero padding
                 memcpy (&out, &tmp[d_s], (d_k - d_s));
@@ -133,10 +174,11 @@ namespace gr {
                 int k = 0; 
 
                 int nerrors_corrected = 0;
+                int bits_corrected = 0;
 
                 for (int i = 0; i < (d_blocks * noutput_items); i++)
                 {
-                    nerrors_corrected = decode(out[k], in[j]);
+                    nerrors_corrected = decode(out[k], in[j], bits_corrected);
 
                     // if nerrors_corrected=-1 it means that the decoder gave up on the word
                     if(nerrors_corrected==-1)
@@ -146,12 +188,20 @@ namespace gr {
                         // We also reset the BER average. 
                         d_last_ber_out = 0.5; 
 
+                        d_stat_uncorrectable++;
+                        publish_stats(false);
+
                         consume_each(i+1); 
                         return i; 
                     }
                     else 
                     {
                         //printf("RS: possible to correct. RS_status: %i\n", rs_status);
+                        d_stat_packets++;
+                        if (nerrors_corrected > 0)
+                            d_stat_corr_packets++;
+                        d_stat_bytes += nerrors_corrected;
+                        d_stat_bits += bits_corrected;
                     }
 
                     j += (d_n - d_s);
@@ -191,6 +241,9 @@ namespace gr {
                 }
 
                 //printf("reed_solomon: blocks: %i, us: %f\n", d_blocks * noutput_items,
+
+
+                publish_stats(false);
 
                 // Tell runtime system how many output items we produced.
                 consume_each(noutput_items); 

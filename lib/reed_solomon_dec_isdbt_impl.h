@@ -31,6 +31,8 @@
 #define INCLUDED_ISDBT_REED_SOLOMON_DEC_ISDBT_IMPL_H
 
 #include <isdbt/reed_solomon_dec_isdbt.h>
+#include <chrono>
+#include <cstdint>
 
 
 extern "C" {
@@ -68,7 +70,24 @@ namespace gr {
       const static int d_lambda;
 
       void *d_rs;    /* Reed-Solomon characteristics structure */
-      int decode(unsigned char &out, const unsigned char &in);
+      int decode(unsigned char &out, const unsigned char &in, int &bits_corrected);
+
+      // Error statistics, cumulative since the block was created. Published
+      // on the "stats" message port (at most every 0.5 s) as a PMT dict:
+      //   packets         (uint64) packets decoded (corrected or error free)
+      //   corrected_packets (uint64) packets that needed at least one correction
+      //   corrected_bytes (uint64) bytes corrected by the RS decoder
+      //   corrected_bits  (uint64) bits corrected by the RS decoder (exact:
+      //                            XOR of the codeword before/after decoding)
+      //   uncorrectable   (uint64) packets the decoder gave up on (they are
+      //                            not output, so they are lost from the TS)
+      uint64_t d_stat_packets;
+      uint64_t d_stat_corr_packets;
+      uint64_t d_stat_bytes;
+      uint64_t d_stat_bits;
+      uint64_t d_stat_uncorrectable;
+      std::chrono::steady_clock::time_point d_last_publish;
+      void publish_stats(bool force);
 
       // Used to average the BER
       float d_alpha_avg;
@@ -81,6 +100,8 @@ namespace gr {
      public:
       reed_solomon_dec_isdbt_impl();
       ~reed_solomon_dec_isdbt_impl();
+
+      bool stop();
 
       // Where all the action really happens
       void forecast (int noutput_items, gr_vector_int &ninput_items_required);
