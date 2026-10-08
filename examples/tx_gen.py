@@ -12,6 +12,8 @@ rate_idx: 0=1/2 1=2/3 2=3/4 3=5/6 4=7/8; I in mode 3: 0, 1, 2, 4.
 Several files can be concatenated (cat T1 T2 > seq.cfile) to emulate a
 modulator that changes its parameters; the receiver sees a resync at each joint.
 Used to validate isdbt_dynamic.py without the modulator (regression library).
+--ts A:file.ts uses a real TS as the content of a layer (e.g. to test the TS
+viewer / PAT insertion); the file is read at the layer bit rate and looped.
 """
 import argparse
 import os
@@ -43,7 +45,7 @@ def make_ts(path, pid, npk=16 * 8192):
 
 
 class tx(gr.top_block):
-    def __init__(self, out, seconds, partial, layers, noise, tsdir):
+    def __init__(self, out, seconds, partial, layers, noise, tsdir, ts_files=None):
         gr.top_block.__init__(self, "tx_gen")
         segs = [layers.get(L, (0, 64, 0, 0))[0] for L in "ABC"]
         assert sum(segs) == 13, segs
@@ -53,8 +55,11 @@ class tx(gr.top_block):
             if L not in layers:
                 continue
             seg, const, rate, I = layers[L]
-            ts = os.path.join(tsdir, "tx_ts_%s.ts" % L)
-            make_ts(ts, 0x100 + idx)
+            if ts_files and L in ts_files:
+                ts = ts_files[L]                         # real TS given by the user (looped)
+            else:
+                ts = os.path.join(tsdir, "tx_ts_%s.ts" % L)
+                make_ts(ts, 0x100 + idx)
             src = blocks.file_source(gr.sizeof_char, ts, True)
             s2v = blocks.stream_to_vector(gr.sizeof_char, 188)
             rs = dtv.dvbt_reed_solomon_enc(2, 8, 0x11d, 255, 239, 8, 51, 1)
@@ -92,6 +97,8 @@ def main():
     ap.add_argument("-s", "--seconds", type=float, default=4.0)
     ap.add_argument("--partial", type=int, default=1)
     ap.add_argument("--noise", type=float, default=0.03)
+    ap.add_argument("--ts", action="append", default=[], metavar="L:FILE",
+                    help="use this TS file (looped) as the content of layer L, e.g. A:a.ts")
     ap.add_argument("--layer", action="append", required=True,
                     help="L:segments:const:rate_idx:I  e.g. B:12:64:2:2")
     a = ap.parse_args()
@@ -100,7 +107,8 @@ def main():
         L, s, c, r, i = spec.split(":")
         layers[L] = (int(s), int(c), int(r), int(i))
     tsdir = os.path.dirname(os.path.abspath(a.out))
-    tb = tx(a.out, a.seconds, bool(a.partial), layers, a.noise, tsdir)
+    ts_files = dict(spec.split(":", 1) for spec in a.ts)
+    tb = tx(a.out, a.seconds, bool(a.partial), layers, a.noise, tsdir, ts_files)
     tb.run()
     print("wrote", a.out, os.path.getsize(a.out) // 8, "samples")
 

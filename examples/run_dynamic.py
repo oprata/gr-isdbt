@@ -4,7 +4,7 @@ run_dynamic.py - runs the generated stbcast_analyzer (fixed part) with the
 per-layer part built automatically from the TMCC (isdbt_dynamic.py).
 
 Live (LimeSDR):
-    python3 run_dynamic.py --rx-gain-init 35 2>&1 | tee dyn_live.log
+    python3 run_dynamic.py --rx-gain-init 45 2>&1 | tee dyn_live.log
 Offline (recorded IQ instead of the LimeSDR):
     python3 run_dynamic.py --iq /dev/shm/iq_T1.cfile [--throttle] 2>&1 | tee dyn_off.log
 
@@ -17,7 +17,21 @@ From GRC (the Run/Execute button of stbcast_analyzer_dyn.grc): the .grc's
 
 Options:
   FLOWGRAPH.py       optional: generated flowgraph file (module/class = its name)
-  --ts-dir DIR       where ts_layer_a/b/c are written (default /tmp/dyn)
+  --record           also write the TS of each layer to <ts-dir>/ts_layer_a|b|c
+                     (needed for ts_check / ts_compare); without it nothing is
+                     written to disk
+  --ts-dir DIR       where the TS files are written with --record (default /tmp/dyn)
+  --rtp-dest HOST    RTP destination of the TS (default 127.0.0.1; a multicast
+                     group such as 239.1.1.1 lets other machines watch too)
+  --rtp-port N       RTP port of layer A; B = N+2, C = N+4 (default 5004)
+  --no-rtp           do not send the TS over the network (and no TS viewer tabs)
+  --ts-proto P       udp (plain TS over UDP, default; what the TS viewer plays
+                     smoothly) or rtp (RTP/MP2T for external receivers; libVLC 3
+                     freezes on it)
+  --no-pat-insert    do not insert a PAT in layers that do not carry one
+  --no-pcr-restamp   send the PCR as received (by default it is regenerated on
+                     the network output: the bench signal's PCR is invalid and
+                     makes live players freeze; recorded files are not changed)
   --hysteresis N     identical valid TMCC frames before (re)building (default 3)
   --duration S       stop after S seconds (default: until the window is closed;
                      offline: until the IQ file has been processed)
@@ -69,10 +83,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("flowgraph_file", nargs="?", metavar="FLOWGRAPH.py")
-    ap.add_argument("--rx-gain-init", type=float, default=None)
+    ap.add_argument("--rx-gain-init", type=float, default=45.0,
+                    help="initial RX gain in dB (default 45)")
     ap.add_argument("--iq", metavar="FILE.cfile")
     ap.add_argument("--throttle", action="store_true")
     ap.add_argument("--ts-dir", default="/tmp/dyn")
+    ap.add_argument("--record", action="store_true")
+    ap.add_argument("--rtp-dest", default="127.0.0.1")
+    ap.add_argument("--rtp-port", type=int, default=5004)
+    ap.add_argument("--no-rtp", action="store_true")
+    ap.add_argument("--ts-proto", choices=("udp", "rtp"), default="udp")
+    ap.add_argument("--no-pcr-restamp", action="store_true")
+    ap.add_argument("--no-pat-insert", action="store_true")
     ap.add_argument("--hysteresis", type=int, default=3)
     ap.add_argument("--duration", type=float, default=0)
     ap.add_argument("--flowgraph", default="stbcast_analyzer_dyn")
@@ -106,12 +128,27 @@ def main():
     cls = getattr(fg, a.flowgraph)
     tb = cls() if a.rx_gain_init is None else cls(rx_gain_init=a.rx_gain_init)
 
-    os.makedirs(a.ts_dir, exist_ok=True)
+    if a.split_ts:
+        a.record = True
+    if a.record:
+        os.makedirs(a.ts_dir, exist_ok=True)
     gui = None if a.no_gui else isdbt_dynamic.gui_from_generated(tb)
     dyn = isdbt_dynamic.DynamicLayers(tb, tb.isdbt_tmcc_decoder_0, mode=tb.mode,
                                       ts_dir=a.ts_dir, hysteresis=a.hysteresis, gui=gui,
-                                      split_ts=a.split_ts)
-    print("TS files: %s/ts_layer_{a,b,c}   hysteresis: %d frames" % (a.ts_dir, a.hysteresis))
+                                      split_ts=a.split_ts, record=a.record,
+                                      rtp=not a.no_rtp, rtp_host=a.rtp_dest,
+                                      rtp_port=a.rtp_port,
+                                      inject_pat=not a.no_pat_insert,
+                                      ts_proto=a.ts_proto,
+                                      pcr_restamp=not a.no_pcr_restamp)
+    print("Hysteresis: %d frames" % a.hysteresis)
+    print("TS files: " + ("%s/ts_layer_{a,b,c}" % a.ts_dir if a.record
+                           else "not recorded (use --record)"))
+    if not a.no_rtp:
+        print("TS output: " + ", ".join("layer %s %s://%s:%d" % (L, a.ts_proto, a.rtp_dest, p)
+                                  for L, p in zip("ABC", dyn.rtp_ports))
+              + ("" if a.no_pat_insert else "  (PAT inserted where missing)")
+              + ("" if a.no_pcr_restamp else "  (PCR regenerated)"))
 
     t0 = time.time()
     if a.iq and not a.throttle:
@@ -190,8 +227,17 @@ def main():
     print("Rebuilds: %d" % dyn.rebuilds)
     for when, dt, desc in dyn.rebuild_log:
         print("  %s  %.2f s  %s" % (when, dt, desc))
+    for k, L in enumerate("ABC"):
+        sink = dyn.rtp_sinks[k]
+        if sink is not None:
+            print("TS out layer %s: %d datagrams sent, %d send errors, %d dropped (queue full),"
+                  " input rate %.0f datagrams/s, PCR rewritten %d (re-anchored %d)%s"
+                  % (L, sink.datagrams, sink.errors, getattr(sink, "dropped", 0),
+                     getattr(sink, "rate", 0.0), getattr(sink, "pcr_rewritten", 0),
+                     getattr(sink, "reanchors", 0),
+                     ", PAT inserted" if sink.injecting else ""))
     import glob
-    for p in dyn.ts_paths:
+    for p in (dyn.ts_paths if a.record else []):
         for f in sorted(glob.glob(p) + glob.glob(p + ".[0-9][0-9]")):
             print()
             ts_check.check(f)

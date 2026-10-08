@@ -46,6 +46,7 @@ except ImportError:                   # GNU Radio 3.9+
     from gnuradio import isdbt
 
 import epy_isdbt_mer
+import ts_rtp
 
 LAYER_NAMES = "ABC"
 CR_TEXT = ["1/2", "2/3", "3/4", "5/6", "7/8"]
@@ -484,12 +485,50 @@ class LayerGui(object):
         """Thread-safe: called from the controller threads."""
         self.bridge.changed.emit(info)
 
+    # ---- TS viewers (libVLC), one tab per layer, only the visible one plays
+    def setup_viewers(self, host, ports, proto="udp"):
+        import ts_viewer
+        self.viewers = []
+        idx = next((i for i in range(self.tabs.count()) if self.tabs.tabText(i) == "Control"),
+                   self.tabs.count())
+        for k, L in enumerate(LAYER_NAMES):
+            v = ts_viewer.TsViewer(L, host, ports[k], proto)
+            self.tabs.insertTab(idx + k, v.widget, "TS Viewer Layer %s" % L)
+            self.tabs.setTabEnabled(idx + k, False)
+            self.viewers.append(v)
+        self.tabs.currentChanged.connect(self._tab_changed)
+
+    def _tab_changed(self, _index=None):
+        cur = self.tabs.currentWidget()
+        for v in getattr(self, "viewers", []):
+            if v.widget is cur and v.available:
+                if not v.playing:
+                    v.play()
+            else:
+                v.stop()
+
+    def _restart_visible_viewer(self):
+        for v in getattr(self, "viewers", []):
+            v.stop()
+        self._tab_changed()
+
+    def release_viewers(self):
+        for v in getattr(self, "viewers", []):
+            v.release()
+
     def _update(self, info):
         self.info = info
         cfg = info.get("cfg")
         for i in range(len(LAYER_NAMES)):
             lp = cfg.layers[i] if cfg else ABSENT
             self.tabs.setTabEnabled(self.first_tab + i, lp.segments > 0)
+        for i, v in enumerate(getattr(self, "viewers", [])):
+            lp = cfg.layers[i] if cfg else ABSENT
+            self.tabs.setTabEnabled(self.tabs.indexOf(v.widget), lp.segments > 0)
+            v.set_available(lp.segments > 0)
+        # the RTP streams restart after a rebuild: restart the visible player
+        # once the deinterleavers have filled
+        self.Qt.QTimer.singleShot(1500, self._restart_visible_viewer)
         self._refresh()
 
     @staticmethod
@@ -517,6 +556,9 @@ class LayerGui(object):
         if cfg is None:
             return
         m = self.controller.metrics()
+        for k, v in enumerate(getattr(self, "viewers", [])):
+            sink = self.controller.rtp_sinks[k]
+            v.set_pat_inserted(bool(sink is not None and sink.injecting))
         rows = [self._row(["Status", "Layer", "MER", "BER (10 s)", "Lost (10 s)",
                            "Modulation", "Code rate", "Interleaving", "Segments"],
                           header=True)]
@@ -577,11 +619,49 @@ class LayerGui(object):
         return "".join(h)
 
 
+# ISDB-Tb channel plan (ABNT NBR 15601): 6 MHz channels, center = band start
+# of the channel + 3 MHz + 1/7 MHz. VHF-high 7-13 (174-216 MHz), UHF 14-69
+# (470-806 MHz).
+def channel_center_hz(ch):
+    if 7 <= ch <= 13:
+        low = 174e6 + 6e6 * (ch - 7)
+    elif 14 <= ch <= 69:
+        low = 470e6 + 6e6 * (ch - 14)
+    else:
+        raise ValueError("channel %r out of 7-13 / 14-69" % (ch,))
+    return int(round(low + 3e6 + 1e6 / 7))
+
+
+def channel_from_hz(hz):
+    """(nearest channel, exact) for a center frequency in Hz."""
+    best = min(list(range(7, 14)) + list(range(14, 70)),
+               key=lambda c: abs(channel_center_hz(c) - hz))
+    return best, abs(channel_center_hz(best) - hz) < 1000
+
+
+def _knob_column(title, dial, value, info=None):
+    """Title on top, knob, value (and optional info line) below, centered."""
+    from PyQt5 import Qt, QtCore
+    box = Qt.QWidget()
+    v = Qt.QVBoxLayout(box)
+    v.setSpacing(4)
+    t = Qt.QLabel(title)
+    f = t.font()
+    f.setBold(True)
+    f.setPointSize(f.pointSize() + 2)
+    t.setFont(f)
+    for w in [t, dial, value] + ([info] if info is not None else []):
+        v.addWidget(w, 0, QtCore.Qt.AlignHCenter)
+    v.addStretch(1)
+    return box
+
+
 def _build_control_tab(tb):
     """Control tab built here (not in the .grc), so it does not depend on
-    which version of the .grc was generated: RX gain knob with its value and
-    center frequency in MHz. The GRC widgets of rx_gain / center_freq are
-    hidden; the new ones call the same setters of the flowgraph."""
+    which version of the .grc was generated: 'RX Gain' knob and 'Channel'
+    knob (ISDB-Tb channel; the center frequency is shown for information),
+    title above each knob. The GRC widgets of rx_gain / center_freq are hidden;
+    the new ones call the same setters of the flowgraph."""
     from PyQt5 import Qt, QtCore
     tabs = tb.tab_widget_layers
     tabs.setTabText(0, "Constellation")
@@ -591,53 +671,66 @@ def _build_control_tab(tb):
             w.setVisible(False)
 
     page = Qt.QWidget()
-    grid = Qt.QGridLayout(page)
-    grid.setColumnStretch(3, 1)
-    grid.setRowStretch(3, 1)
+    row = Qt.QHBoxLayout(page)
     big = Qt.QFont()
     big.setPointSize(big.pointSize() + 6)
     big.setBold(True)
 
-    # RX gain: knob + value
+    def make_dial(lo, hi, page_step):
+        d = Qt.QDial()
+        d.setRange(lo, hi)
+        d.setSingleStep(1)
+        d.setPageStep(page_step)
+        d.setNotchesVisible(True)
+        d.setWrapping(False)
+        d.setFixedSize(170, 170)
+        return d
+
+    # RX Gain
     rng = getattr(tb, "_rx_gain_range", None)
     gmin = int(getattr(rng, "min", 0)) if rng else 0
     gmax = int(getattr(rng, "max", 50)) if rng else 50
-    dial = Qt.QDial()
-    dial.setRange(gmin, gmax)
-    dial.setSingleStep(1)
-    dial.setPageStep(5)
-    dial.setNotchesVisible(True)
-    dial.setWrapping(False)
-    dial.setFixedSize(170, 170)
-    dial.setValue(int(round(tb.get_rx_gain())))
+    gain = make_dial(gmin, gmax, 5)
+    gain.setValue(int(round(tb.get_rx_gain())))
     gain_value = Qt.QLabel()
     gain_value.setFont(big)
-    gain_value.setMinimumWidth(90)
 
     def gain_changed(v):
         gain_value.setText("%d dB" % v)
         tb.set_rx_gain(float(v))
-    dial.valueChanged.connect(gain_changed)
-    gain_value.setText("%d dB" % dial.value())
-    grid.addWidget(Qt.QLabel("RX gain"), 0, 0, QtCore.Qt.AlignVCenter)
-    grid.addWidget(dial, 0, 1)
-    grid.addWidget(gain_value, 0, 2, QtCore.Qt.AlignVCenter)
+    gain.valueChanged.connect(gain_changed)
+    gain_value.setText("%d dB" % gain.value())
 
-    # Center frequency in MHz (applied with Enter / when leaving the field)
-    freq = Qt.QDoubleSpinBox()
-    freq.setDecimals(6)
-    freq.setRange(50.0, 1000.0)
-    freq.setSingleStep(6.0)
-    freq.setSuffix(" MHz")
-    freq.setKeyboardTracking(False)
-    freq.setMinimumWidth(180)
-    freq.setValue(tb.get_center_freq() / 1e6)
-    freq.valueChanged.connect(lambda mhz: tb.set_center_freq(int(round(mhz * 1e6))))
-    grid.addWidget(Qt.QLabel("Center frequency"), 1, 0)
-    grid.addWidget(freq, 1, 1, 1, 2)
-    hint = Qt.QLabel("Press Enter to apply. The channel step is 6 MHz.")
-    hint.setStyleSheet("color: gray")
-    grid.addWidget(hint, 2, 1, 1, 3)
+    # Channel (applied when the knob is released, or at each wheel/key step)
+    chan = make_dial(7, 69, 6)
+    chan.setTracking(False)
+    ch0, exact = channel_from_hz(tb.get_center_freq())
+    chan.setValue(ch0)
+    chan_value = Qt.QLabel()
+    chan_value.setFont(big)
+    chan_info = Qt.QLabel()
+    chan_info.setStyleSheet("color: gray")
+
+    def show_channel(ch, applied=True):
+        chan_value.setText("Ch %d" % ch)
+        hz = channel_center_hz(ch)
+        band = "VHF" if ch <= 13 else "UHF"
+        chan_info.setText("%s - %.6f MHz%s" % (band, hz / 1e6, "" if applied else " (release to tune)"))
+
+    def chan_changed(ch):
+        tb.set_center_freq(channel_center_hz(ch))
+        show_channel(ch)
+    chan.valueChanged.connect(chan_changed)
+    chan.sliderMoved.connect(lambda ch: show_channel(ch, False))
+    show_channel(ch0)
+    if not exact:          # started off the channel plan: keep it, say so
+        chan_info.setText("%.6f MHz (not a channel center; nearest Ch %d)"
+                          % (tb.get_center_freq() / 1e6, ch0))
+
+    row.addWidget(_knob_column("RX Gain", gain, gain_value))
+    row.addSpacing(40)
+    row.addWidget(_knob_column("Channel", chan, chan_value, chan_info))
+    row.addStretch(1)
 
     # put it in the 'Control' tab of the .grc if there is one, else create it
     idx = next((i for i in range(tabs.count()) if tabs.tabText(i) == "Control"), None)
@@ -649,7 +742,7 @@ def _build_control_tab(tb):
             lay.addWidget(page)
         else:
             tabs.addTab(page, "Control")
-    tb._dyn_control = (page, dial, freq)       # keep references
+    tb._dyn_control = (page, gain, chan)       # keep references
 
 
 def gui_from_generated(tb):
@@ -682,7 +775,8 @@ class DynamicLayers(object):
 
     def __init__(self, tb, tmcc_block, mode=3, ts_dir="/tmp", hysteresis=3,
                  gui=None, on_change=None, mer_stride=4, fresh_ts=True, split_ts=False,
-                 log=None):
+                 record=False, rtp=True, rtp_host="127.0.0.1", rtp_port=5004,
+                 inject_pat=True, log=None, ts_proto="udp", pcr_restamp=True):
         self.tb = tb
         self.tmcc_block = tmcc_block
         self.mode = int(mode)
@@ -693,10 +787,19 @@ class DynamicLayers(object):
         self.on_change = on_change
         self.mer_stride = mer_stride
         self.split_ts = split_ts
+        self.record = record                  # TS files only with --record
+        self.rtp = rtp
+        self.rtp_host = rtp_host
+        self.ts_proto = ts_proto              # 'udp' (plain TS, default) or 'rtp'
+        self.pcr_restamp = pcr_restamp        # regenerate the PCR on the network output
+        self.rtp_ports = [int(rtp_port) + 2 * k for k in range(3)]   # A, B, C
+        self.inject_pat = inject_pat
+        self.pat_registry = ts_rtp.PatRegistry()
+        self.rtp_sinks = [None, None, None]
         self.log = log or (lambda s: print("[dyn %s] %s" % (time.strftime("%H:%M:%S"), s),
                                            flush=True))
         self.ts_paths = [os.path.join(ts_dir, "ts_layer_" + L.lower()) for L in LAYER_NAMES]
-        if fresh_ts:
+        if fresh_ts and record:
             import glob
             for p in self.ts_paths:
                 for f in glob.glob(p) + glob.glob(p + ".[0-9][0-9]"):
@@ -722,6 +825,8 @@ class DynamicLayers(object):
         self.lock = threading.Lock()
         if gui is not None:
             gui.controller = self
+            if rtp:
+                gui.setup_viewers(rtp_host, self.rtp_ports, ts_proto)
 
         self.watcher = tmcc_watcher(self._on_tmcc)
         tb.msg_connect((tmcc_block, "tmcc"), (self.watcher, "tmcc"))
@@ -866,6 +971,7 @@ class DynamicLayers(object):
                 blks.append(v2s_c)
 
         probes = [None, None, None]
+        rtp_sinks = [None, None, None]
         for k, lp in enumerate(L):
             sinks = self.gui.sinks[k] if self.gui else None
             if not lp.segments:
@@ -882,13 +988,33 @@ class DynamicLayers(object):
             v2s = blocks.vector_to_stream(gr.sizeof_char, 188)
             s2v = blocks.stream_to_vector(gr.sizeof_char, 1316)
             s2v.set_min_output_buffer(797)
-            path = self.ts_paths[k]
-            if self.split_ts:
-                path = "%s.%02d" % (path, self.rebuilds + 1)
-            fs = blocks.file_sink(gr.sizeof_char * 1316, path, True)
-            fs.set_unbuffered(True)
-            chain((dem, k), bdi, vit, byd, eds, rs, v2s, s2v, fs)
-            ts_sinks.append(fs)
+            chain((dem, k), bdi, vit, byd, eds, rs, v2s, s2v)
+            outputs = 0
+            if self.record:
+                path = self.ts_paths[k]
+                if self.split_ts:
+                    path = "%s.%02d" % (path, self.rebuilds + 1)
+                fs = blocks.file_sink(gr.sizeof_char * 1316, path, True)
+                fs.set_unbuffered(True)
+                chain(s2v, fs)
+                ts_sinks.append(fs)
+                blks.append(fs)
+                outputs += 1
+            if self.rtp:
+                rtp = ts_rtp.ts_rtp_sink(self.rtp_host, self.rtp_ports[k], self.pat_registry,
+                                         self.inject_pat,
+                                         rtp_header=(self.ts_proto == "rtp"),
+                                         pkt_rate=ts_rtp.layer_packet_rate(
+                                             m, lp.segments, lp.constellation, lp.rate),
+                                         pcr_restamp=self.pcr_restamp)
+                chain(s2v, rtp)
+                blks.append(rtp)
+                rtp_sinks[k] = rtp
+                outputs += 1
+            if not outputs:
+                ns_ts = blocks.null_sink(gr.sizeof_char * 1316)
+                chain(s2v, ns_ts)
+                blks.append(ns_ts)
 
             # Post-Viterbi errors: exact counters of the RS decoder (patch 0003),
             # shown as counts in a 10 s window instead of the gr-isdbt moving
@@ -905,8 +1031,9 @@ class DynamicLayers(object):
             if sinks:
                 chain((mer, k), sinks["mer"])
             probes[k] = {"mer": p_mer}
-            blks += [bdi, vit, byd, eds, rs, v2s, s2v, fs, p_mer]
+            blks += [bdi, vit, byd, eds, rs, v2s, s2v, p_mer]
         self.probes = probes
+        self.rtp_sinks = rtp_sinks
         return edges, msg_edges, blks, ts_sinks
 
     # ---- for the launcher / future facade ----
@@ -927,6 +1054,9 @@ class DynamicLayers(object):
         return out
 
     def close(self):
-        """Stop the worker (call before tb.stop())."""
+        """Stop the worker and the video players (call before tb.stop(), from
+        the GUI thread)."""
+        if self.gui is not None:
+            self.gui.release_viewers()
         self.jobs.put(None)
         self.worker.join(timeout=10)
