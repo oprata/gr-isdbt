@@ -47,8 +47,8 @@ blocks:
   id: variable_qtgui_entry
   parameters:
     comment: ''
-    gui_hint: ''
-    label: Center freq.
+    gui_hint: 'tab_widget_layers@4: 1,0,1,1'
+    label: Center frequency (Hz)
     type: int
     value: '473142857'
   states:
@@ -98,8 +98,8 @@ blocks:
   id: variable_qtgui_range
   parameters:
     comment: ''
-    gui_hint: ''
-    label: ''
+    gui_hint: 'tab_widget_layers@4: 0,0,1,1'
+    label: RX gain (dB)
     min_len: '200'
     orient: Qt.Horizontal
     rangeType: float
@@ -107,7 +107,7 @@ blocks:
     step: '1'
     stop: '50'
     value: rx_gain_init
-    widget: counter
+    widget: dial
   states:
     bus_sink: false
     bus_source: false
@@ -292,7 +292,7 @@ blocks:
     color8: '"red"'
     color9: '"red"'
     comment: ''
-    grid: 'False'
+    grid: 'True'
     gui_hint: tab_widget_layers@0
     label1: ''
     label10: ''
@@ -304,7 +304,7 @@ blocks:
     label7: ''
     label8: ''
     label9: ''
-    legend: 'True'
+    legend: 'False'
     marker1: '0'
     marker10: '0'
     marker2: '0'
@@ -315,7 +315,7 @@ blocks:
     marker7: '0'
     marker8: '0'
     marker9: '0'
-    name: '""'
+    name: '"Data carriers (all layers)"'
     nconnections: '1'
     size: data_carriers
     style1: '0'
@@ -379,7 +379,7 @@ blocks:
     alias: ''
     comment: ''
     gui_hint: ''
-    label0: Overview
+    label0: Constellation
     label1: Layer A
     label10: Tab 10
     label11: Tab 11
@@ -393,13 +393,13 @@ blocks:
     label19: Tab 19
     label2: Layer B
     label3: Layer C
-    label4: Tab 4
+    label4: Control
     label5: Tab 5
     label6: Tab 6
     label7: Tab 7
     label8: Tab 8
     label9: Tab 9
-    num_tabs: '4'
+    num_tabs: '5'
   states:
     bus_sink: false
     bus_source: false

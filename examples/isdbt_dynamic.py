@@ -15,7 +15,7 @@ tmcc_decoder):
                       -> TS file (append)
                       + error counters of the RS decoder ('stats' port, patch 0003):
                         BER after Viterbi counted in a 10 s window, packets
-                        corrected / lost, status OK / Margem baixa / Perda
+                        corrected / lost, status OK / Low margin / Packet loss
                  -> MER of each layer (epy_isdbt_mer.py)
 
 Rebuild = stop / wait / reconnect / start of the whole flowgraph, from a worker
@@ -150,6 +150,41 @@ class frame_resync(gr.sync_block):
         return n
 
 
+class layer_points(gr.sync_block):
+    """Feeds the constellation with the symbols of each layer separately.
+
+    Input : time_deinterleaver output (data carriers, layer A first, then B, C).
+    Output: 3 vectors of `npts` symbols per OFDM symbol (layers A, B, C), taken
+            evenly across each layer's carriers so that every layer gets the
+            same number of points (a 12-segment layer would otherwise hide a
+            1-segment one). An absent layer outputs NaN (not plotted).
+    Sync block, 1 input item per call (D24)."""
+
+    def __init__(self, vlen, carriers_per_segment, segments, npts=384):
+        gr.sync_block.__init__(self, name="layer_points",
+                               in_sig=[(np.complex64, vlen)],
+                               out_sig=[(np.complex64, npts)] * 3)
+        self.index = []
+        start = 0
+        for seg in segments:
+            ncar = seg * carriers_per_segment
+            if seg > 0:
+                self.index.append(start + np.linspace(0, ncar - 1, npts).astype(np.int64))
+            else:
+                self.index.append(None)
+            start += ncar
+
+    def work(self, input_items, output_items):
+        x = input_items[0]
+        n = len(output_items[0])
+        for k, idx in enumerate(self.index):
+            if idx is None:
+                output_items[k][:n] = np.nan
+            else:
+                output_items[k][:n] = x[:n, idx]
+        return n
+
+
 class tmcc_watcher(gr.basic_block):
     """Message-only block: forwards every 'tmcc' message to a Python callback."""
 
@@ -219,7 +254,7 @@ class LayerStats(object):
     Warm-up: right after a (re)build the time deinterleaver is still filling and
     the RS decoder rejects the first packets. Everything before the first
     successfully decoded packet is ignored (kept only in warmup_lost), so the
-    status does not start as "Perda de pacotes"."""
+    status does not start as "Packet loss"."""
 
     WINDOW = 10.0
 
@@ -282,55 +317,69 @@ def _sup(n):
 
 
 def fmt_sci(x, ascii_only=False):
-    """2.3e-07 -> '2,3×10⁻⁷' (or '2.3e-07' with ascii_only)."""
+    """2.3e-07 -> '2.3×10⁻⁷' (or '2.3e-07' with ascii_only)."""
     if ascii_only:
         return "%.1e" % x
     m, e = ("%.1e" % x).split("e")
-    return "%s×10%s" % (m.replace(".", ","), _sup(int(e)))
+    return "%s×10%s" % (m, _sup(int(e)))
 
 
 def fmt_int(n):
-    return "{:,}".format(int(n)).replace(",", ".")
+    return "{:,}".format(int(n))
 
 
 def fmt_big(n):
     if n < 1e6:
         return fmt_int(n)
     if n < 1e9:
-        return ("%.1f milhões" % (n / 1e6)).replace(".", ",")
-    return ("%.2f bilhões" % (n / 1e9)).replace(".", ",")
+        return "%.1f M" % (n / 1e6)
+    return "%.2f G" % (n / 1e9)
+
+
+def fmt_duration(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "%d s" % sec
+    if sec < 3600:
+        return "%d min %02d s" % (sec // 60, sec % 60)
+    return "%d h %02d min" % (sec // 3600, (sec % 3600) // 60)
+
+
+def _ber_text(bits, nbits, ascii_only):
+    if nbits == 0:
+        return "-"
+    if bits == 0:
+        return "0 (< %s)" % fmt_sci(1.0 / nbits, ascii_only)
+    return fmt_sci(bits / float(nbits), ascii_only)
 
 
 def evaluate(snap, ascii_only=False):
-    """Turns a LayerStats snapshot into what is shown: status, BER text, ..."""
+    """Turns a LayerStats snapshot into what is shown: status, BER texts, ..."""
     if snap is None:
         return None
     if not snap["supported"]:
-        return {"status": "BER indisponível", "color": "gray", "ber": None,
-                "ber_text": "indisponível (gr-isdbt sem o patch 0003)", "win": None,
+        return {"status": "BER unavailable", "color": "gray", "ber": None,
+                "ber_text": "unavailable (gr-isdbt without patch 0003)", "win": None,
                 "total": None, "since": snap["since"]}
     w, t = snap["win"], snap["total"]
     nbits = w["packets"] * BITS_PER_PACKET
+    tbits = t["packets"] * BITS_PER_PACKET
     ber = (w["corrected_bits"] / float(nbits)) if nbits else None
-    if nbits == 0:
-        ber_text = "-"
-    elif w["corrected_bits"] == 0:
-        ber_text = "0 (< %s)" % fmt_sci(1.0 / nbits, ascii_only)
-    else:
-        ber_text = fmt_sci(ber, ascii_only)
     if not snap["started"]:
-        status, color = "Aguardando", "gray"    # deinterleaver filling after a rebuild
+        status, color = "Waiting", "gray"          # deinterleaver filling after a rebuild
     elif snap["age"] is None or snap["age"] > 3.0:
-        status, color = "Sem dados", "gray"
+        status, color = "No data", "gray"
     elif w["uncorrectable"] > 0:
-        status, color = "Perda de pacotes", "#d00000"
+        status, color = "Packet loss", "#d00000"
     elif ber is not None and ber > QEF_BER:
-        status, color = "Margem baixa", "#e08000"
+        status, color = "Low margin", "#e08000"
     else:
         status, color = "OK", "#00a000"
-    return {"status": status, "color": color, "ber": ber, "ber_text": ber_text,
-            "nbits": nbits, "win": w, "total": t, "since": snap["since"],
-            "window_s": snap["window_s"]}
+    return {"status": status, "color": color, "ber": ber,
+            "ber_text": _ber_text(w["corrected_bits"], nbits, ascii_only),
+            "total_ber_text": _ber_text(t["corrected_bits"], tbits, ascii_only),
+            "nbits": nbits, "tbits": tbits, "win": w, "total": t,
+            "since": snap["since"], "window_s": snap["window_s"]}
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +393,31 @@ def _wrap_widget(sink):
         from PyQt5 import sip
     getw = getattr(sink, "pyqwidget", None) or getattr(sink, "qwidget")
     return sip.wrapinstance(getw(), Qt.QWidget)
+
+
+CONST_POINTS = 384          # symbols per layer per OFDM symbol sent to the plot
+LAYER_COLORS = ("red", "blue", "orange")
+
+
+def _layer_const_sink():
+    """Constellation with one input per layer: A red, B blue, C orange."""
+    from gnuradio import qtgui
+    s = qtgui.const_sink_c(4 * CONST_POINTS, "Data carriers by layer", 3)
+    s.set_update_time(0.10)
+    s.set_y_axis(-1.5, 1.5)
+    s.set_x_axis(-1.5, 1.5)
+    s.set_trigger_mode(qtgui.TRIG_MODE_FREE, qtgui.TRIG_SLOPE_POS, 0.0, 0, "")
+    s.enable_autoscale(False)
+    s.enable_grid(True)
+    s.enable_axis_labels(True)
+    for i, L in enumerate(LAYER_NAMES):
+        s.set_line_label(i, "Layer %s" % L)
+        s.set_line_color(i, LAYER_COLORS[i])
+        s.set_line_width(i, 1)
+        s.set_line_style(i, 0)
+        s.set_line_marker(i, 0)
+        s.set_line_alpha(i, 1.0)
+    return s
 
 
 def _number_sink(title, vmin, vmax, unit=""):
@@ -360,12 +434,16 @@ def _number_sink(title, vmin, vmax, unit=""):
 
 
 class LayerGui(object):
-    """Widgets of the analyzer.
+    """Widgets of the analyzer (all texts in English).
 
-    Overview tab : TMCC line + one summary row per layer.
-    Layer tabs   : status panel (situation, MER, BER after Viterbi counted in a
-                   10 s window, packets corrected / lost, totals) + MER bar.
+    Constellation tab : constellation (from the .grc) + one row per layer
+                        (modulation, code rate, interleaving, segments, status,
+                        MER, BER and lost packets in the last 10 s).
+    Layer A/B/C tabs  : transmission parameters, reception quality in the last
+                        10 s, totals since the current configuration, MER bar.
     Refreshed once per second from DynamicLayers.metrics() (GUI thread)."""
+
+    TABLE = "<table border='0' cellspacing='0' cellpadding='4'>"
 
     def __init__(self, tabs, overview_layout, layer_layouts, first_layer_tab=1):
         from PyQt5 import Qt, QtCore
@@ -378,10 +456,9 @@ class LayerGui(object):
         self.first_tab = first_layer_tab
         self.controller = None            # set by DynamicLayers
         self.info = {}
-        self.status = Qt.QLabel("TMCC: aguardando um quadro válido...")
-        self.status.setWordWrap(True)
-        overview_layout.addWidget(self.status)
-        self.summary = Qt.QLabel("")
+        self.const = _layer_const_sink()
+        overview_layout.insertWidget(0, _wrap_widget(self.const))
+        self.summary = Qt.QLabel("Waiting for a valid TMCC frame...")
         self.summary.setTextFormat(QtCore.Qt.RichText)
         overview_layout.addWidget(self.summary)
         self.sinks = []
@@ -391,10 +468,11 @@ class LayerGui(object):
             panel.setTextFormat(QtCore.Qt.RichText)
             panel.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
             layer_layouts[i].addWidget(panel)
-            mer = _number_sink("MER camada %s" % L, 0, 40, "dB")
+            mer = _number_sink("MER", 0, 40, "dB")
             layer_layouts[i].addWidget(_wrap_widget(mer))
             self.panels.append(panel)
             self.sinks.append({"mer": mer})
+            tabs.setTabText(first_layer_tab + i, "Layer %s" % L)
             tabs.setTabEnabled(first_layer_tab + i, False)
         self.bridge = Bridge()
         self.bridge.changed.connect(self._update)      # queued: runs in the GUI thread
@@ -409,81 +487,179 @@ class LayerGui(object):
     def _update(self, info):
         self.info = info
         cfg = info.get("cfg")
-        self.status.setText("TMCC: %s\nReconstruções: %d   última: %s" % (
-            describe(cfg), info.get("rebuilds", 0), info.get("last", "-")))
-        for i, L in enumerate(LAYER_NAMES):
+        for i in range(len(LAYER_NAMES)):
             lp = cfg.layers[i] if cfg else ABSENT
-            idx = self.first_tab + i
-            self.tabs.setTabEnabled(idx, lp.segments > 0)
-            self.tabs.setTabText(idx, "Layer %s" % L if not lp.segments
-                                 else "Layer %s - %s" % (L, describe_layer(lp)))
+            self.tabs.setTabEnabled(self.first_tab + i, lp.segments > 0)
         self._refresh()
 
     @staticmethod
     def _dot(color):
-        return "<span style='color:%s; font-size:14pt'>&#9679;</span>" % color
+        return "<span style='color:%s'>&#9679;</span>" % color
+
+    @staticmethod
+    def _params(lp):
+        return (MOD_TEXT.get(lp.constellation, "?"),
+                CR_TEXT[lp.rate] if 0 <= lp.rate <= 4 else "?",
+                "I = %d" % lp.interleaving, str(lp.segments))
+
+    def _row(self, cells, header=False):
+        if header:
+            return "<tr>%s</tr>" % "".join(
+                "<th align='left' style='color:#606060; padding-right:12px'>%s</th>" % c
+                for c in cells)
+        return "<tr>%s</tr>" % "".join(
+            "<td style='padding-right:12px'>%s</td>" % c for c in cells)
 
     def _refresh(self):
         if self.controller is None:
             return
         cfg = self.info.get("cfg")
+        if cfg is None:
+            return
         m = self.controller.metrics()
-        now = time.strftime("%H:%M:%S")
-        rows = []
+        rows = [self._row(["Status", "Layer", "MER", "BER (10 s)", "Lost (10 s)",
+                           "Modulation", "Code rate", "Interleaving", "Segments"],
+                          header=True)]
         for i, L in enumerate(LAYER_NAMES):
-            lp = cfg.layers[i] if cfg else ABSENT
+            lp = cfg.layers[i]
             e = m.get(L)
             if not lp.segments or e is None:
                 self.panels[i].setText("")
                 continue
-            mer = ("%.1f dB" % e["mer"]).replace(".", ",") if e["mer"] > 0 else "-"
-            ber_html = html_escape(e["ber_text"])
-            rows.append("<tr><td><b>%s</b></td><td>%s</td><td>%s %s</td><td>%s</td>"
-                        "<td>%s</td><td>%s</td></tr>" % (
-                            L, describe_layer(lp), self._dot(e["color"]), e["status"], mer,
-                            ber_html,
-                            fmt_int(e["win"]["uncorrectable"]) if e["win"] else "-"))
-            html = ["<p><b>Camada %s - %s</b> &nbsp; <span style='color:gray'>atualizado %s</span></p>"
-                    % (L, describe_layer(lp), now), "<table cellpadding='3'>"]
-            html.append("<tr><td>Situação</td><td>%s <b>%s</b></td></tr>"
-                        % (self._dot(e["color"]), e["status"]))
-            html.append("<tr><td>MER</td><td>%s</td></tr>" % mer)
-            if e["win"] is not None:
-                w, t = e["win"], e["total"]
-                win_s = int(round(e["window_s"]))
-                html.append("<tr><td>Erros pós-Viterbi (últimos %d s)</td><td>%s bits corrigidos em %s"
-                            " &rarr; BER %s</td></tr>" % (win_s, fmt_int(w["corrected_bits"]),
-                                                          fmt_big(e["nbits"]), ber_html))
-                html.append("<tr><td>Pacotes corrigidos pelo RS (%d s)</td><td>%s de %s</td></tr>"
-                            % (win_s, fmt_int(w["corrected_packets"]), fmt_int(w["packets"])))
-                html.append("<tr><td>Pacotes perdidos (%d s)</td><td>%s</td></tr>"
-                            % (win_s, fmt_int(w["uncorrectable"])))
-                html.append("<tr><td>Desde %s (config. atual)</td><td>%s pacotes &middot; %s bits"
-                            " corrigidos &middot; %s perdidos</td></tr>" % (
-                                time.strftime("%H:%M:%S", time.localtime(e["since"])),
-                                fmt_big(t["packets"]), fmt_int(t["corrected_bits"]),
-                                fmt_int(t["uncorrectable"])))
-                html.append("<tr><td colspan='2' style='color:gray'>Referência: BER pós-Viterbi"
-                            " &le; 2&times;10<sup>-4</sup> &rarr; TS sem erros após o Reed-Solomon"
-                            "</td></tr>")
-            else:
-                html.append("<tr><td>BER pós-Viterbi</td><td>%s</td></tr>" % ber_html)
-            html.append("</table>")
-            self.panels[i].setText("".join(html))
-        if rows:
-            self.summary.setText(
-                "<p>atualizado %s</p><table cellpadding='4' border='0'>"
-                "<tr><th align='left'>Camada</th><th align='left'>Configuração</th>"
-                "<th align='left'>Situação</th><th align='left'>MER</th>"
-                "<th align='left'>BER pós-Viterbi (10 s)</th><th align='left'>Perdidos (10 s)</th></tr>"
-                "%s</table>" % (now, "".join(rows)))
+            mod, cr, il, seg = self._params(lp)
+            mer = "%.1f dB" % e["mer"] if e["mer"] > 0 else "-"
+            status = "%s %s" % (self._dot(e["color"]), e["status"])
+            ber = html_escape(e["ber_text"])
+            lost = fmt_int(e["win"]["uncorrectable"]) if e["win"] else "-"
+            rows.append(self._row([status, "<b>%s</b>" % L, mer, ber, lost, mod, cr, il, seg]))
+            self.panels[i].setText(self._layer_html(L, lp, e, mer, status, ber))
+        self.summary.setText(
+            "<p>Partial reception: <b>%s</b></p>%s%s</table>"
+            % ("ON" if cfg.partial else "OFF", self.TABLE, "".join(rows)))
+
+    def _layer_html(self, L, lp, e, mer, status, ber):
+        mod, cr, il, seg = self._params(lp)
+        h = ["<h3>Layer %s</h3>" % L,
+             "<p><b>Transmission parameters</b> (TMCC)</p>", self.TABLE,
+             self._row(["Modulation", "Code rate", "Interleaving", "Segments"], True),
+             self._row([mod, cr, il, seg]), "</table>"]
+        if e["win"] is None:
+            h += ["<p><b>Reception quality</b></p>", self.TABLE,
+                  self._row(["Status", "MER", "BER after Viterbi"], True),
+                  self._row([status, mer, ber]), "</table>"]
+            return "".join(h)
+        w, t = e["win"], e["total"]
+        win_s = max(1, int(round(e["window_s"])))
+        h += ["<p><b>Reception quality</b> - last %d s</p>" % win_s, self.TABLE,
+              self._row(["Status", "MER", "BER after Viterbi", "Corrected bits",
+                         "Corrected packets", "Lost packets"], True),
+              self._row([status, mer, ber,
+                         "%s of %s" % (fmt_int(w["corrected_bits"]), fmt_big(e["nbits"])),
+                         "%s of %s" % (fmt_int(w["corrected_packets"]), fmt_int(w["packets"])),
+                         fmt_int(w["uncorrectable"])]),
+              "</table>"]
+        elapsed = time.time() - e["since"]
+        received = t["packets"] + t["uncorrectable"]
+        loss = (100.0 * t["uncorrectable"] / received) if received else 0.0
+        h += ["<p><b>Current configuration totals</b> - since %s (%s)</p>" % (
+                  time.strftime("%H:%M:%S", time.localtime(e["since"])), fmt_duration(elapsed)),
+              self.TABLE,
+              self._row(["Packets", "Corrected packets", "Corrected bits",
+                         "BER after Viterbi", "Lost packets", "Loss"], True),
+              self._row([fmt_big(t["packets"]), fmt_int(t["corrected_packets"]),
+                         fmt_int(t["corrected_bits"]), html_escape(e["total_ber_text"]),
+                         fmt_int(t["uncorrectable"]),
+                         "0 %" if t["uncorrectable"] == 0 else "%.3f %%" % loss]),
+              "</table>",
+              "<p style='color:gray'>Reference: BER after Viterbi &le; 2&times;10<sup>-4</sup>"
+              " &rarr; quasi error-free TS after Reed-Solomon. Updated %s</p>"
+              % time.strftime("%H:%M:%S")]
+        return "".join(h)
+
+
+def _build_control_tab(tb):
+    """Control tab built here (not in the .grc), so it does not depend on
+    which version of the .grc was generated: RX gain knob with its value and
+    center frequency in MHz. The GRC widgets of rx_gain / center_freq are
+    hidden; the new ones call the same setters of the flowgraph."""
+    from PyQt5 import Qt, QtCore
+    tabs = tb.tab_widget_layers
+    tabs.setTabText(0, "Constellation")
+    for name in ("_rx_gain_win", "_center_freq_tool_bar", "_qtgui_const_sink_x_0_win"):
+        w = getattr(tb, name, None)
+        if w is not None:
+            w.setVisible(False)
+
+    page = Qt.QWidget()
+    grid = Qt.QGridLayout(page)
+    grid.setColumnStretch(3, 1)
+    grid.setRowStretch(3, 1)
+    big = Qt.QFont()
+    big.setPointSize(big.pointSize() + 6)
+    big.setBold(True)
+
+    # RX gain: knob + value
+    rng = getattr(tb, "_rx_gain_range", None)
+    gmin = int(getattr(rng, "min", 0)) if rng else 0
+    gmax = int(getattr(rng, "max", 50)) if rng else 50
+    dial = Qt.QDial()
+    dial.setRange(gmin, gmax)
+    dial.setSingleStep(1)
+    dial.setPageStep(5)
+    dial.setNotchesVisible(True)
+    dial.setWrapping(False)
+    dial.setFixedSize(170, 170)
+    dial.setValue(int(round(tb.get_rx_gain())))
+    gain_value = Qt.QLabel()
+    gain_value.setFont(big)
+    gain_value.setMinimumWidth(90)
+
+    def gain_changed(v):
+        gain_value.setText("%d dB" % v)
+        tb.set_rx_gain(float(v))
+    dial.valueChanged.connect(gain_changed)
+    gain_value.setText("%d dB" % dial.value())
+    grid.addWidget(Qt.QLabel("RX gain"), 0, 0, QtCore.Qt.AlignVCenter)
+    grid.addWidget(dial, 0, 1)
+    grid.addWidget(gain_value, 0, 2, QtCore.Qt.AlignVCenter)
+
+    # Center frequency in MHz (applied with Enter / when leaving the field)
+    freq = Qt.QDoubleSpinBox()
+    freq.setDecimals(6)
+    freq.setRange(50.0, 1000.0)
+    freq.setSingleStep(6.0)
+    freq.setSuffix(" MHz")
+    freq.setKeyboardTracking(False)
+    freq.setMinimumWidth(180)
+    freq.setValue(tb.get_center_freq() / 1e6)
+    freq.valueChanged.connect(lambda mhz: tb.set_center_freq(int(round(mhz * 1e6))))
+    grid.addWidget(Qt.QLabel("Center frequency"), 1, 0)
+    grid.addWidget(freq, 1, 1, 1, 2)
+    hint = Qt.QLabel("Press Enter to apply. The channel step is 6 MHz.")
+    hint.setStyleSheet("color: gray")
+    grid.addWidget(hint, 2, 1, 1, 3)
+
+    # put it in the 'Control' tab of the .grc if there is one, else create it
+    idx = next((i for i in range(tabs.count()) if tabs.tabText(i) == "Control"), None)
+    if idx is None:
+        tabs.addTab(page, "Control")
+    else:
+        lay = getattr(tb, "tab_widget_layers_layout_%d" % idx, None)
+        if lay is not None:
+            lay.addWidget(page)
         else:
-            self.summary.setText("")
+            tabs.addTab(page, "Control")
+    tb._dyn_control = (page, dial, freq)       # keep references
 
 
 def gui_from_generated(tb):
     """LayerGui using the 'tab_widget_layers' QTabWidget of the generated
-    stbcast_analyzer (tab 0 = Overview, tabs 1-3 = layers A-C)."""
+    stbcast_analyzer_dyn (tab 0 = Constellation, tabs 1-3 = layers A-C,
+    tab 4 = Control)."""
+    try:
+        _build_control_tab(tb)
+    except Exception as e:                   # the analyzer works without it
+        print("[dyn] control tab not built: %r" % (e,), flush=True)
     return LayerGui(tb.tab_widget_layers, tb.tab_widget_layers_layout_0,
                     [tb.tab_widget_layers_layout_1, tb.tab_widget_layers_layout_2,
                      tb.tab_widget_layers_layout_3])
@@ -679,6 +855,15 @@ class DynamicLayers(object):
         chain(self.tmcc_block, gate, fdi, tdi, dem)
         chain(tdi, mer)
         blks += [gate, fdi, tdi, dem, mer]
+        if self.gui is not None:                    # constellation by layer
+            pts = layer_points(self.vlen, self.vlen // 13, [lp.segments for lp in L],
+                               CONST_POINTS)
+            chain(tdi, pts)
+            blks.append(pts)
+            for k in range(3):
+                v2s_c = blocks.vector_to_stream(gr.sizeof_gr_complex, CONST_POINTS)
+                chain((pts, k), v2s_c, (self.gui.const, k))
+                blks.append(v2s_c)
 
         probes = [None, None, None]
         for k, lp in enumerate(L):
