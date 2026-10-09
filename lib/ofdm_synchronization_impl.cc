@@ -114,6 +114,9 @@ namespace gr {
                   d_rho = d_snr / (d_snr + 1.0);
 
                   d_initial_acquired = false; 
+                  d_failed_acq = 0;
+                  d_last_resync_msg = 0;
+                  d_resyncs = 0;
 
                   //VOLK alignment as recommended by GNU Radio's Manual. It has a similar effect 
                   //than set_output_multiple(), thus we will generally get multiples of this value
@@ -848,6 +851,7 @@ namespace gr {
 
                     if ( d_cp_found )
                     {
+                        d_failed_acq = 0;
                         // safe-margin. Using a too adjusted CP position may result in taking samples from the NEXT ofdm 
                         // symbol. It is better to stay on the safe-side (plus, 10 samples is nothing in this context). 
                         d_cp_start_offset = -10;  
@@ -965,7 +969,31 @@ namespace gr {
                         // Restart with a half number so that we'll not endup with the same situation (in the case when 
                         // the CP was in a weird position, like too near the border). 
                         // This will prevent peak_detect to not detect anything
-                        d_consumed += (d_cp_length+d_fft_length)/2;
+                        int skip = (d_cp_length+d_fft_length)/2;
+
+                        // Recovery: the full CP search costs far more than real time, so after a
+                        // sync loss the block falls behind, the hardware drops samples and the
+                        // search keeps failing on the gaps (seen live: it never recovered).
+                        // After a few failures, jump to the newest input so that the next search
+                        // works on contiguous samples. (The peak detector is NOT reset: its
+                        // averages keep it from locking on noise.)
+                        if (++d_failed_acq >= 4)
+                        {
+                            int keep = (int)ceil((d_cp_length + d_fft_length) * 2 * d_samp_inc) + d_inter.ntaps();
+                            int avail = ninput_items[0] - d_consumed - keep;
+                            if (avail > skip)
+                                skip = avail;
+                            d_failed_acq = 0;
+                            d_resyncs++;
+                            double now = (double)std::time(nullptr);
+                            if (now - d_last_resync_msg > 1.0 || d_resyncs == 1)
+                            {
+                                fprintf(stderr, "OFDM_SYNCHRO: sync lost, re-acquiring (skipped %d samples, %ld times)\n",
+                                        skip, d_resyncs);
+                                d_last_resync_msg = now;
+                            }
+                        }
+                        d_consumed += skip;
                         consume_each(d_consumed);
                         // Tell runtime system how many output items we produced.
                         // bye!

@@ -76,6 +76,10 @@ namespace gr {
                 float d_phase; 
                 
                 bool d_initial_acquired; 
+                // consecutive failed CP searches / time of the last "lost sync" message
+                int d_failed_acq;
+                double d_last_resync_msg;
+                long d_resyncs;
 
                 int d_consumed; 
                 int d_out; 
