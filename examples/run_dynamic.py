@@ -4,7 +4,7 @@ run_dynamic.py - runs the generated stbcast_analyzer (fixed part) with the
 per-layer part built automatically from the TMCC (isdbt_dynamic.py).
 
 Live (LimeSDR):
-    python3 run_dynamic.py --rx-gain-init 45 2>&1 | tee dyn_live.log
+    python3 run_dynamic.py --rx-gain-init 38 2>&1 | tee dyn_live.log
 Offline (recorded IQ instead of the LimeSDR):
     python3 run_dynamic.py --iq /dev/shm/iq_T1.cfile [--throttle] 2>&1 | tee dyn_off.log
 
@@ -83,8 +83,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("flowgraph_file", nargs="?", metavar="FLOWGRAPH.py")
-    ap.add_argument("--rx-gain-init", type=float, default=45.0,
-                    help="initial RX gain in dB (default 45)")
+    ap.add_argument("--rx-gain-init", type=float, default=38.0,
+                    help="initial RX gain in dB (default 38: ADC peak ~-5 dBFS on the bench "
+                         "signal; 45 clipped the ADC)")
     ap.add_argument("--iq", metavar="FILE.cfile")
     ap.add_argument("--throttle", action="store_true")
     ap.add_argument("--ts-dir", default="/tmp/dyn")
@@ -133,6 +134,13 @@ def main():
     if a.record:
         os.makedirs(a.ts_dir, exist_ok=True)
     gui = None if a.no_gui else isdbt_dynamic.gui_from_generated(tb)
+    if getattr(tb, "_rf_level", None) is None and os.environ.get("ISDBT_NO_SPECTRUM") != "1":
+        try:
+            import rf_level
+            tb._rf_level = rf_level.RfLevel(tb, tb.limesdr_source_0, tb.low_pass_filter_0,
+                                            float(tb.samp_rate))
+        except Exception as e:
+            print("RF level not available: %r" % (e,))
     dyn = isdbt_dynamic.DynamicLayers(tb, tb.isdbt_tmcc_decoder_0, mode=tb.mode,
                                       ts_dir=a.ts_dir, hysteresis=a.hysteresis, gui=gui,
                                       split_ts=a.split_ts, record=a.record,
@@ -164,7 +172,68 @@ def main():
     if not a.no_gui:
         tb.show()
 
-    state = {"last_ok": 0}
+    state = {"last_ok": 0, "stall_ticks": 0, "stall_reported": False, "counts": {}}
+
+    def gr_blocks():
+        """(label, block) of the running flowgraph: fixed part, spectrum/level
+        branches and the current dynamic chain."""
+        seen, out = set(), []
+
+        def add(label, b):
+            if b is None or id(b) in seen:
+                return
+            if not (hasattr(b, "nitems_read") or hasattr(b, "nitems_written")):
+                return
+            seen.add(id(b))
+            if label in ("spectrum", "rf_level"):
+                try:
+                    label = "%s %s" % (label, b.name())
+                except Exception:
+                    pass
+            out.append((label, b))
+        for k, v in sorted(vars(tb).items()):
+            add(k, v)
+        for b in getattr(tb, "_dyn_spectrum", ())[1:5]:
+            add("spectrum", b)
+        rf = getattr(tb, "_rf_level", None)
+        if rf is not None:
+            for b in rf._blocks:
+                add("rf_level", b)
+        for b in dyn.blocks:
+            try:
+                add("dyn %s#%d" % (b.name(), b.unique_id()), b)
+            except Exception:
+                add("dyn", b)
+        return out
+
+    def counters():
+        c = {}
+        for label, b in gr_blocks():
+            r = w = None
+            try:
+                r = int(b.nitems_read(0))
+            except Exception:
+                pass
+            try:
+                w = int(b.nitems_written(0))
+            except Exception:
+                pass
+            c[label + " " + str(id(b))] = (label, r, w)
+        return c
+
+    def stall_report(prev, cur):
+        print("=" * 70, flush=True)
+        print("STALL: no TMCC frame for %d s. Items read / written by each block in the "
+              "last 2 s (0 = stopped):" % (2 * state["stall_ticks"]), flush=True)
+        for key, (label, r, w) in cur.items():
+            pr = prev.get(key)
+            if pr is None:
+                continue
+            dr = (r - pr[1]) if r is not None and pr[1] is not None else None
+            dw = (w - pr[2]) if w is not None and pr[2] is not None else None
+            print("  %-45s read %+12s  written %+12s" % (label[:45],
+                  "-" if dr is None else dr, "-" if dw is None else dw), flush=True)
+        print("=" * 70, flush=True)
 
     def tick():
         el = time.time() - t0
@@ -180,9 +249,22 @@ def main():
                                     e["win"]["uncorrectable"]))
                 else:
                     parts.append("%s: MER %4.1f dB | BER n/a" % (L, e["mer"]))
-        print("[%6.1f s] TMCC ok %d bad %d | %s" % (el, dyn.frames_ok, dyn.frames_bad,
-                                                   " | ".join(parts) or "no layer built"),
+        rf = getattr(tb, "_rf_level", None)
+        rf_txt = (rf.log_text() + " | ") if rf is not None and rf.log_text() else ""
+        print("[%6.1f s] %sTMCC ok %d bad %d | %s" % (el, rf_txt, dyn.frames_ok, dyn.frames_bad,
+                                                     " | ".join(parts) or "no layer built"),
               flush=True)
+        # stall watchdog (Rodada 54): TMCC frames stopped while the source runs
+        cur = counters()
+        if not a.iq and dyn.frames_ok + dyn.frames_bad == state["last_ok"] and state["last_ok"] > 0:
+            state["stall_ticks"] += 1
+            if state["stall_ticks"] >= 2 and not state["stall_reported"]:
+                stall_report(state["counts"], cur)
+                state["stall_reported"] = True
+        else:
+            state["stall_ticks"] = 0
+        state["last_ok"] = dyn.frames_ok + dyn.frames_bad
+        state["counts"] = cur
         if a.duration and el >= a.duration:
             Qt.QApplication.quit()
         # offline: finished when no TMCC frame arrived for 5 s

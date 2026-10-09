@@ -380,7 +380,7 @@ class ts_rtp_sink(gr.sync_block):
         with self.cond:
             self.queue.extend(out)
             holding = self.rate <= 0 or (self.pcr_restamp and self.anchor is None)
-            limit = 400000 if holding else int(self.rate * self.max_queue_s)
+            limit = 400000 if holding else max(4000, int(self.rate * self.max_queue_s))
             while len(self.queue) > limit:   # sender cannot keep up: drop oldest
                 self.queue.popleft()
                 self.dropped += 1

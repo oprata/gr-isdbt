@@ -30,6 +30,7 @@ Works with GNU Radio 3.8 (import isdbt) and 3.9+ (from gnuradio import isdbt).
 """
 
 import collections
+import math
 from html import escape as html_escape
 import os
 import queue
@@ -455,6 +456,9 @@ class LayerGui(object):
         self.Qt = Qt
         self.tabs = tabs
         self.first_tab = first_layer_tab
+        # tab pages of layers A-C: found by page, not by index (Rodada 53:
+        # the Spectrum tab is inserted at index 0)
+        self.layer_pages = [lay.parentWidget() for lay in layer_layouts]
         self.controller = None            # set by DynamicLayers
         self.info = {}
         self.const = _layer_const_sink()
@@ -473,8 +477,10 @@ class LayerGui(object):
             layer_layouts[i].addWidget(_wrap_widget(mer))
             self.panels.append(panel)
             self.sinks.append({"mer": mer})
-            tabs.setTabText(first_layer_tab + i, "Layer %s" % L)
-            tabs.setTabEnabled(first_layer_tab + i, False)
+            pg = self.layer_pages[i]
+            pi = tabs.indexOf(pg) if pg is not None else -1
+            tabs.setTabText(pi if pi >= 0 else first_layer_tab + i, "Layer %s" % L)
+            tabs.setTabEnabled(pi if pi >= 0 else first_layer_tab + i, False)
         self.bridge = Bridge()
         self.bridge.changed.connect(self._update)      # queued: runs in the GUI thread
         self.timer = Qt.QTimer()
@@ -521,7 +527,9 @@ class LayerGui(object):
         cfg = info.get("cfg")
         for i in range(len(LAYER_NAMES)):
             lp = cfg.layers[i] if cfg else ABSENT
-            self.tabs.setTabEnabled(self.first_tab + i, lp.segments > 0)
+            page = self.layer_pages[i]
+            idx = self.tabs.indexOf(page) if page is not None else -1
+            self.tabs.setTabEnabled(idx if idx >= 0 else self.first_tab + i, lp.segments > 0)
         for i, v in enumerate(getattr(self, "viewers", [])):
             lp = cfg.layers[i] if cfg else ABSENT
             self.tabs.setTabEnabled(self.tabs.indexOf(v.widget), lp.segments > 0)
@@ -656,7 +664,7 @@ def _knob_column(title, dial, value, info=None):
     return box
 
 
-def _build_control_tab(tb):
+def _build_control_tab(tb, rf=None):
     """Control tab built here (not in the .grc), so it does not depend on
     which version of the .grc was generated: 'RX Gain' knob and 'Channel'
     knob (ISDB-Tb channel; the center frequency is shown for information),
@@ -664,14 +672,19 @@ def _build_control_tab(tb):
     the new ones call the same setters of the flowgraph."""
     from PyQt5 import Qt, QtCore
     tabs = tb.tab_widget_layers
-    tabs.setTabText(0, "Constellation")
+    const_page = getattr(tb, "tab_widget_layers_widget_0", None)
+    ci = tabs.indexOf(const_page) if const_page is not None else -1
+    tabs.setTabText(ci if ci >= 0 else 0, "Constellation")
     for name in ("_rx_gain_win", "_center_freq_tool_bar", "_qtgui_const_sink_x_0_win"):
         w = getattr(tb, name, None)
         if w is not None:
             w.setVisible(False)
 
     page = Qt.QWidget()
-    row = Qt.QHBoxLayout(page)
+    outer = Qt.QVBoxLayout(page)
+    knobs = Qt.QWidget()
+    row = Qt.QHBoxLayout(knobs)
+    outer.addWidget(knobs)
     big = Qt.QFont()
     big.setPointSize(big.pointSize() + 6)
     big.setBold(True)
@@ -732,6 +745,79 @@ def _build_control_tab(tb):
     row.addWidget(_knob_column("Channel", chan, chan_value, chan_info))
     row.addStretch(1)
 
+    # Level calibration (rf_level.py): makes the channel power readable in dBm
+    if rf is not None:
+        box = Qt.QGroupBox("Level calibration (dBm)")
+        g = Qt.QGridLayout(box)
+        level = Qt.QLabel("Measuring the signal level...")
+        level.setTextFormat(QtCore.Qt.RichText)
+        level.setSizePolicy(Qt.QSizePolicy.Ignored, Qt.QSizePolicy.Fixed)
+        cal_info = Qt.QLabel(rf.cal_text())
+        cal_info.setStyleSheet("color: gray")
+        steps = Qt.QLabel(
+            "The LimeSDR measures the signal only relative to its converter (dBFS). "
+            "To show it in dBm it needs one reference:<br>"
+            "<b>1.</b> Feed the LimeSDR with a signal of known level - e.g. the modulator: "
+            "its output level minus the loss of cables and attenuators.<br>"
+            "<b>2.</b> Type that level below.<br>"
+            "<b>3.</b> Press <b>Calibrate</b>. From then on the channel power is shown in dBm "
+            "(here and in the Spectrum tab). The calibration is saved and stays valid "
+            "when the RX Gain changes; repeat it if you change the LimeSDR, the antenna "
+            "port or the band.")
+        steps.setTextFormat(QtCore.Qt.RichText)
+        steps.setWordWrap(True)
+        ref = Qt.QDoubleSpinBox()
+        ref.setRange(-130.0, 20.0)
+        ref.setDecimals(1)
+        ref.setSingleStep(0.5)
+        ref.setSuffix(" dBm")
+        ref.setValue(rf.cal.get("reference_dbm", -40.0) if rf.cal else -40.0)
+        btn = Qt.QPushButton("Calibrate")
+        clr = Qt.QPushButton("Clear calibration")
+        g.addWidget(steps, 0, 0, 1, 4)
+        g.addWidget(Qt.QLabel("Known level at the LimeSDR input:"), 1, 0)
+        g.addWidget(ref, 1, 1)
+        g.addWidget(btn, 1, 2)
+        g.addWidget(clr, 1, 3)
+        g.addWidget(level, 2, 0, 1, 4)
+        g.addWidget(cal_info, 3, 0, 1, 4)
+        outer.addWidget(box)
+
+        def level_text():
+            r = rf.reading()
+            if r["chan_dbfs"] is None:
+                return "Measuring the signal level..."
+            if r["dbm"] is not None:
+                return ("Channel power now: <b>%.1f dBm</b> (%.1f dBFS at the ADC, RX Gain %.0f dB)"
+                        % (r["dbm"], r["chan_dbfs"], r["gain"]))
+            return ("Channel power now: <b>%.1f dBFS</b> (RX Gain %.0f dB) - not calibrated"
+                    % (r["chan_dbfs"], r["gain"]))
+
+        def do_cal():
+            try:
+                rf.calibrate(ref.value())
+            except Exception as e:
+                cal_info.setText("Calibration failed: %s" % e)
+                return
+            cal_info.setText(rf.cal_text())
+            level.setText(level_text())
+
+        def do_clear():
+            rf.clear_cal()
+            cal_info.setText(rf.cal_text())
+            level.setText(level_text())
+        btn.clicked.connect(do_cal)
+        clr.clicked.connect(do_clear)
+
+        def refresh_level():
+            if page.isVisible():
+                level.setText(level_text())
+        level_timer = QtCore.QTimer()
+        level_timer.timeout.connect(refresh_level)
+        level_timer.start(1000)
+        tb._dyn_level_timer = level_timer
+    outer.addStretch(1)
+
     # put it in the 'Control' tab of the .grc if there is one, else create it
     idx = next((i for i in range(tabs.count()) if tabs.tabText(i) == "Control"), None)
     if idx is None:
@@ -739,7 +825,7 @@ def _build_control_tab(tb):
     else:
         lay = getattr(tb, "tab_widget_layers_layout_%d" % idx, None)
         if lay is not None:
-            lay.addWidget(page)
+            lay.insertWidget(0, page, 100)    # on top, taking the space of the hidden GRC widgets
         else:
             tabs.addTab(page, "Control")
     tb._dyn_control = (page, gain, chan)       # keep references
@@ -747,12 +833,33 @@ def _build_control_tab(tb):
 
 def gui_from_generated(tb):
     """LayerGui using the 'tab_widget_layers' QTabWidget of the generated
-    stbcast_analyzer_dyn (tab 0 = Constellation, tabs 1-3 = layers A-C,
-    tab 4 = Control)."""
+    stbcast_analyzer_dyn. Final tab order: Spectrum, Constellation, Layer A-C,
+    TS Viewer A-C, Control (the .grc has Constellation, Layer A-C, Control)."""
+    import rf_level
+    rf = None
+    if os.environ.get("ISDBT_NO_SPECTRUM") == "1":     # test switch (Rodada 54)
+        print("[dyn] Spectrum tab and RF level disabled (ISDBT_NO_SPECTRUM=1)", flush=True)
+        try:
+            _build_control_tab(tb, None)
+        except Exception as e:
+            print("[dyn] control tab not built: %r" % (e,), flush=True)
+        return LayerGui(tb.tab_widget_layers, tb.tab_widget_layers_layout_0,
+                        [tb.tab_widget_layers_layout_1, tb.tab_widget_layers_layout_2,
+                         tb.tab_widget_layers_layout_3])
     try:
-        _build_control_tab(tb)
+        rf = rf_level.RfLevel(tb, tb.limesdr_source_0, tb.low_pass_filter_0, float(tb.samp_rate))
+        tb._rf_level = rf
+    except Exception as e:
+        print("[dyn] RF level not available: %r" % (e,), flush=True)
+    try:
+        _build_control_tab(tb, rf)
     except Exception as e:                   # the analyzer works without it
         print("[dyn] control tab not built: %r" % (e,), flush=True)
+    if rf is not None:
+        try:
+            rf_level.build_spectrum_tab(tb, rf, index=0)   # left of Constellation
+        except Exception as e:
+            print("[dyn] spectrum tab not built: %r" % (e,), flush=True)
     return LayerGui(tb.tab_widget_layers, tb.tab_widget_layers_layout_0,
                     [tb.tab_widget_layers_layout_1, tb.tab_widget_layers_layout_2,
                      tb.tab_widget_layers_layout_3])
@@ -828,6 +935,7 @@ class DynamicLayers(object):
             if rtp:
                 gui.setup_viewers(rtp_host, self.rtp_ports, ts_proto)
 
+        tb._dyn_controller = self              # used by the Spectrum tab (total MER)
         self.watcher = tmcc_watcher(self._on_tmcc)
         tb.msg_connect((tmcc_block, "tmcc"), (self.watcher, "tmcc"))
 
@@ -1035,6 +1143,26 @@ class DynamicLayers(object):
         self.probes = probes
         self.rtp_sinks = rtp_sinks
         return edges, msg_edges, blks, ts_sinks
+
+    def total_mer(self):
+        """MER of the whole channel (all built layers), in dB, or None.
+        Constellations are normalized to unit power per carrier, so the error
+        powers add up weighted by the number of carriers (segments):
+        MER = -10 log10( sum(seg_i * 10^(-MER_i/10)) / sum(seg_i) )."""
+        cfg = self.active
+        if cfg is None:
+            return None
+        num = den = 0.0
+        for k, p in enumerate(self.probes):
+            seg = cfg.layers[k].segments
+            if not p or not seg:
+                continue
+            mer = p["mer"].level()
+            if mer <= 0:                    # no complete window yet
+                return None
+            num += seg * 10 ** (-mer / 10.0)
+            den += seg
+        return -10 * math.log10(num / den) if den else None
 
     # ---- for the launcher / future facade ----
     def metrics(self, ascii_only=False):

@@ -365,7 +365,7 @@ blocks:
     label: ''
     short_id: ''
     type: eng_float
-    value: '45'
+    value: '38'
   states:
     bus_sink: false
     bus_source: false
