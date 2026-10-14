@@ -236,6 +236,9 @@ def build_spectrum_tab(tb, rf, index=0):
     mer_title = Qt.QLabel("MER (all layers)")
     mer_value = Qt.QLabel("...")
     mer_value.setFont(big)
+    mer_tx = Qt.QLabel("")
+    mer_tx.setStyleSheet("color: darkorange")
+    mer_tx.setWordWrap(True)
     adc = Qt.QLabel("")
     adc.setWordWrap(True)
     adc.setTextFormat(QtCore.Qt.RichText)
@@ -247,6 +250,7 @@ def build_spectrum_tab(tb, rf, index=0):
     v.addSpacing(18)
     v.addWidget(mer_title)
     v.addWidget(mer_value)
+    v.addWidget(mer_tx)
     v.addSpacing(18)
     v.addWidget(adc)
     v.addStretch(1)
@@ -270,7 +274,21 @@ def build_spectrum_tab(tb, rf, index=0):
             mer = dyn.total_mer() if dyn is not None else None
         except Exception:
             mer = None
-        mer_value.setText("%.1f dB" % mer if mer is not None else "-")
+        try:
+            import isdbt_dynamic
+            mer_value.setText(isdbt_dynamic.mer_display(mer, "total"))
+            corrected = isdbt_dynamic.mer_corrected_active()
+        except Exception:
+            mer_value.setText("%.1f dB" % mer if mer is not None else "-")
+            corrected = False
+        suspended = False
+        try:
+            suspended = isdbt_dynamic.mer_suspended()
+        except Exception:
+            pass
+        mer_title.setText("MER (all layers, corrected)" if corrected else "MER (all layers)")
+        mer_tx.setText("Measured value: the level at the ADC changed since the MER calibration "
+                       "(correction suspended)" if suspended else "")
         r = rf.reading()
         if r["chan_dbfs"] is None:
             pw_value.setText("...")

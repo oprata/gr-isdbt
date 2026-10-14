@@ -41,6 +41,7 @@
 #include <volk/volk.h>
 //for debugging 
 #include <ctime>
+#include <cstdlib>
 
 namespace gr {
     namespace isdbt {
@@ -115,6 +116,9 @@ namespace gr {
 
                   d_initial_acquired = false; 
                   d_failed_acq = 0;
+                  d_fail_samples = 0;
+                  d_last_peak = 0;
+                  d_detector_resets = 0;
                   d_last_resync_msg = 0;
                   d_resyncs = 0;
 
@@ -362,6 +366,21 @@ namespace gr {
                 {
                     advance_delta_loop(delta_est_error);
                     advance_freq_loop(freq_est_error);
+                }
+
+                // Sanity limits: the sampling clock error of real hardware is a few ppm and
+                // the fine frequency stays within a couple of carriers. Values beyond that
+                // come from tracking noise: restart the loop.
+                if (std::abs(d_est_delta) > 2e-4)
+                {
+                    d_est_delta = 0;
+                    d_delta_aux = 0;
+                }
+                if (std::abs(d_fine_freq) > 4*M_PI)
+                {
+                    d_fine_freq = 0;
+                    d_freq_aux = 0;
+                    d_freq_offset_acq = false;   // let the integer estimator take it
                 }
 
                 d_samp_inc = 1.0-d_est_delta; 
@@ -682,6 +701,7 @@ namespace gr {
                     }
                 }
 
+                d_last_peak = datain[peak_index];
                 *peak_pos = peak_index;
                 return (success);
             }
@@ -711,15 +731,49 @@ namespace gr {
 
                 // Calculate time delay and frequency correction
                 float sum_aux = 0;
-                for (int i = lookup_start - 1; i >= lookup_stop; i--)
+                if (lookup_start - lookup_stop <= 64)
                 {
-                    int k = i - lookup_stop;
-                    //TODO no accumulator for complexes in VOLK for the moment (exists since April 2021, change lines when widespread).    
-                    volk_32fc_32f_dot_prod_32fc(&d_gamma[k], &d_corr[i-d_cp_length+1-d_fft_length], d_ones, d_cp_length);
-                    //volk_32fc_accumulator_s32fc(&d_gamma[k], &d_corr[i-d_cp_length+1-d_fft_length], d_cp_length);
-                    volk_32f_accumulator_s32f(&d_phi[k], &d_norm[i-d_cp_length+1], d_cp_length);
-                    volk_32f_accumulator_s32f(&sum_aux, &d_norm[i-d_cp_length+1-d_fft_length], d_cp_length);
-                    d_phi[k] += sum_aux;
+                    // small (tracking) window: direct sums
+                    for (int i = lookup_start - 1; i >= lookup_stop; i--)
+                    {
+                        int k = i - lookup_stop;
+                        //TODO no accumulator for complexes in VOLK for the moment (exists since April 2021, change lines when widespread).    
+                        volk_32fc_32f_dot_prod_32fc(&d_gamma[k], &d_corr[i-d_cp_length+1-d_fft_length], d_ones, d_cp_length);
+                        //volk_32fc_accumulator_s32fc(&d_gamma[k], &d_corr[i-d_cp_length+1-d_fft_length], d_cp_length);
+                        volk_32f_accumulator_s32f(&d_phi[k], &d_norm[i-d_cp_length+1], d_cp_length);
+                        volk_32f_accumulator_s32f(&sum_aux, &d_norm[i-d_cp_length+1-d_fft_length], d_cp_length);
+                        d_phi[k] += sum_aux;
+                    }
+                }
+                else
+                {
+                    // Full search: the same sums as running (sliding-window) sums, O(fft)
+                    // instead of O(fft*cp). The direct version costs about 4x real time
+                    // in mode 3; with a real receiver the source then drops samples, every
+                    // search window has gaps and the receiver never re-acquires
+                    // (seen live after the RF was switched off and on).
+                    const int cp = d_cp_length, N = d_fft_length;
+                    int i = lookup_stop;
+                    std::complex<double> g(0.0, 0.0);
+                    double pa = 0.0, pb = 0.0;
+                    for (int j = 0; j < cp; j++)
+                    {
+                        g  += std::complex<double>(d_corr[i - cp + 1 - N + j]);
+                        pa += d_norm[i - cp + 1 + j];
+                        pb += d_norm[i - cp + 1 - N + j];
+                    }
+                    for (;;)
+                    {
+                        int k = i - lookup_stop;
+                        d_gamma[k] = gr_complex((float)g.real(), (float)g.imag());
+                        d_phi[k] = (float)(pa + pb);
+                        if (++i > lookup_start - 1)
+                            break;
+                        // slide by one: add the new last element, drop the old first one
+                        g  += std::complex<double>(d_corr[i - N]) - std::complex<double>(d_corr[i - cp - N]);
+                        pa += (double)d_norm[i] - (double)d_norm[i - cp];
+                        pb += (double)d_norm[i - N] - (double)d_norm[i - cp - N];
+                    }
                 }
 
                 // Init lambda with gamma
@@ -818,6 +872,16 @@ namespace gr {
                         // TODO is necessary to re-calculate the integer frequency?
                         d_freq_offset_acq = false;
 
+                        // A full search re-estimates the coarse frequency, so start the
+                        // integer and fine frequency estimates again. Without this they keep
+                        // integrating noise while there is no signal (seen in tests: integer
+                        // offset of -1887 carriers after a few seconds without RF) and the
+                        // receiver never locks when the signal comes back.
+                        d_freq_offset = 0;
+                        d_freq_offset_agree_count = 0;
+                        d_fine_freq = 0;
+                        d_freq_aux = 0;
+
                     }
                     else
                     {
@@ -828,7 +892,16 @@ namespace gr {
                         //estimates of frequency and CP position. 
                         int cp_start_temp; 
                         float coarse_freq_temp; 
-                        d_cp_found = ml_sync(&in[d_consumed], d_cp_start + 8, std::max(d_cp_start - 8,d_cp_length+d_fft_length-1), &cp_start_temp, &coarse_freq_temp);
+                        // The search window must stay inside the buffers sized for the full
+                        // search (d_norm/d_corr hold 2*fft+cp samples). Without the upper limit,
+                        // tracking noise lets d_cp_start creep up by up to 16 per symbol and
+                        // ml_sync() writes past d_norm (heap corruption, random crashes when
+                        // there is no signal).
+                        const int win_hi = 2 * d_fft_length + d_cp_length - 1;
+                        const int win_lo = d_cp_length + d_fft_length - 1;
+                        if (d_cp_start > win_hi) d_cp_start = win_hi;
+                        if (d_cp_start < win_lo) d_cp_start = win_lo;
+                        d_cp_found = ml_sync(&in[d_consumed], std::min(d_cp_start + 8, win_hi), std::max(d_cp_start - 8, win_lo), &cp_start_temp, &coarse_freq_temp);
                         //d_cp_start = cp_start_temp; 
                         //d_coarse_freq = coarse_freq_temp; 
 
@@ -837,7 +910,7 @@ namespace gr {
                             // We may have not found the CP because the smaller search range was too small (rare, but possible, in 
                             // particular when sampling time error are present). We thus re-try with a bigger search range and 
                             // update d_cp_start. 
-                            d_cp_found = ml_sync(&in[d_consumed], d_cp_start+16, std::max(d_cp_start-16,d_cp_length+d_fft_length-1), \
+                            d_cp_found = ml_sync(&in[d_consumed], std::min(d_cp_start + 16, win_hi), std::max(d_cp_start - 16, win_lo), \
                                     &d_cp_start, &coarse_freq_temp);
                             
                             //Since I'm moving the position, the interpolator's phase should be restarted too
@@ -852,6 +925,7 @@ namespace gr {
                     if ( d_cp_found )
                     {
                         d_failed_acq = 0;
+                        d_fail_samples = 0;
                         // safe-margin. Using a too adjusted CP position may result in taking samples from the NEXT ofdm 
                         // symbol. It is better to stay on the safe-side (plus, 10 samples is nothing in this context). 
                         d_cp_start_offset = -10;  
@@ -888,6 +962,13 @@ namespace gr {
                         }
                         // Since I'm compensating it in the derotator I have to add it
                         d_freq_offset += current_freq_offset;
+                        // A real offset is within the estimator range; anything beyond is noise.
+                        if (std::abs(d_freq_offset) > d_freq_offset_max)
+                        {
+                            d_freq_offset = 0;
+                            d_freq_offset_agree_count = 0;
+                            d_freq_offset_acq = false;
+                        }
 
                         // correct the integer frequency offset (point to the shifted position)
                         d_integer_freq_derotated = &d_postfft[0] + current_freq_offset + d_zeros_on_left; 
@@ -985,15 +1066,34 @@ namespace gr {
                                 skip = avail;
                             d_failed_acq = 0;
                             d_resyncs++;
-                            double now = (double)std::time(nullptr);
-                            if (now - d_last_resync_msg > 1.0 || d_resyncs == 1)
+                            // If the search has failed for about one second of signal, the
+                            // peak detector averages are probably stuck (they only move on a
+                            // success, so a level jump can leave the threshold above every
+                            // real peak; seen live after the RF came back). Start them again.
+                            bool reset_detector = d_fail_samples > 1000L * (d_cp_length + d_fft_length);
+                            float old_max = d_avg_max, old_min = d_avg_min;
+                            if (reset_detector)
                             {
-                                fprintf(stderr, "OFDM_SYNCHRO: sync lost, re-acquiring (skipped %d samples, %ld times)\n",
-                                        skip, d_resyncs);
+                                peak_detect_init(0.3, 0.9);
+                                d_fail_samples = 0;
+                                d_detector_resets++;
+                            }
+                            // Definite loss: restart the sampling clock loop as well.
+                            d_est_delta = 0;
+                            d_delta_aux = 0;
+                            d_samp_inc = 1;
+                            double now = (double)std::time(nullptr);
+                            if (reset_detector || now - d_last_resync_msg > 1.0 || d_resyncs == 1)
+                            {
+                                fprintf(stderr, "OFDM_SYNCHRO: sync lost, re-acquiring (skipped %d samples, %ld times;"
+                                        " peak %.3g avg_max %.3g avg_min %.3g%s, detector resets %ld)\n",
+                                        skip, d_resyncs, d_last_peak, old_max, old_min,
+                                        reset_detector ? " -> detector reset" : "", d_detector_resets);
                                 d_last_resync_msg = now;
                             }
                         }
                         d_consumed += skip;
+                        d_fail_samples += skip;
                         consume_each(d_consumed);
                         // Tell runtime system how many output items we produced.
                         // bye!

@@ -29,6 +29,10 @@ Options:
                      smoothly) or rtp (RTP/MP2T for external receivers; libVLC 3
                      freezes on it)
   --no-pat-insert    do not insert a PAT in layers that do not carry one
+  --log-csv FILE     append one line of measurements every --log-interval s to
+                     FILE (CSV: time, RF level, MER measured / transmitter
+                     estimate, status, BER, packets per layer). Off by default.
+  --log-interval S   seconds between CSV lines (default 10)
   --no-pcr-restamp   send the PCR as received (by default it is regenerated on
                      the network output: the bench signal's PCR is invalid and
                      makes live players freeze; recorded files are not changed)
@@ -95,6 +99,8 @@ def main():
     ap.add_argument("--no-rtp", action="store_true")
     ap.add_argument("--ts-proto", choices=("udp", "rtp"), default="udp")
     ap.add_argument("--no-pcr-restamp", action="store_true")
+    ap.add_argument("--log-csv", metavar="FILE")
+    ap.add_argument("--log-interval", type=float, default=10.0)
     ap.add_argument("--no-pat-insert", action="store_true")
     ap.add_argument("--hysteresis", type=int, default=3)
     ap.add_argument("--duration", type=float, default=0)
@@ -139,6 +145,8 @@ def main():
             import rf_level
             tb._rf_level = rf_level.RfLevel(tb, tb.limesdr_source_0, tb.low_pass_filter_0,
                                             float(tb.samp_rate))
+            import mer_cal
+            mer_cal.get().level_fn = lambda: tb._rf_level.reading()["chan_dbfs"]
         except Exception as e:
             print("RF level not available: %r" % (e,))
     dyn = isdbt_dynamic.DynamicLayers(tb, tb.isdbt_tmcc_decoder_0, mode=tb.mode,
@@ -172,7 +180,58 @@ def main():
     if not a.no_gui:
         tb.show()
 
-    state = {"last_ok": 0, "stall_ticks": 0, "stall_reported": False, "counts": {}}
+    state = {"last_ok": 0, "stall_ticks": 0, "stall_reported": False, "counts": {},
+             "last_log": 0.0}
+
+    # ---- CSV measurement log (--log-csv), Rodada 57
+    log_file = None
+    if a.log_csv:
+        import csv
+        import mer_cal
+        new_file = not os.path.exists(a.log_csv) or os.path.getsize(a.log_csv) == 0
+        log_file = open(a.log_csv, "a", newline="")
+        log_csv = csv.writer(log_file)
+        if new_file:
+            head = ["time", "elapsed_s", "tmcc_ok", "tmcc_bad", "rebuilds", "config",
+                    "rf_dbfs", "adc_peak_dbfs", "rf_dbm", "mer_total_db", "mer_total_tx_db"]
+            for L in "ABC":
+                head += ["%s_status" % L, "%s_mer_db" % L, "%s_mer_tx_db" % L, "%s_ber" % L,
+                         "%s_packets" % L, "%s_corrected" % L, "%s_lost" % L]
+            log_csv.writerow(head)
+            log_file.flush()
+        print("CSV log: %s every %.0f s" % (a.log_csv, a.log_interval))
+
+    def write_log(el, m):
+        def f1(v):
+            return "" if v is None else "%.1f" % v
+        mc = mer_cal.get()
+
+        def tx(mer, key):          # corrected value, ">40" near the floor, "" if none
+            v, txt = mc.estimate(mer, key)
+            if v is not None:
+                return "%.1f" % v
+            return txt.replace(" dB", "").replace(" ", "") if txt else ""
+        rf = getattr(tb, "_rf_level", None)
+        r = rf.reading() if rf is not None else {}
+        tot = dyn.total_mer()
+        cfg = dyn.active
+        row = [time.strftime("%Y-%m-%d %H:%M:%S"), "%.0f" % el, dyn.frames_ok, dyn.frames_bad,
+               dyn.rebuilds, isdbt_dynamic.describe(cfg) if cfg is not None else "",
+               f1(r.get("chan_dbfs")), f1(r.get("peak_dbfs")), f1(r.get("dbm")),
+               f1(tot), tx(tot, "total")]
+        for L in "ABC":
+            e = m.get(L)
+            if e is None:
+                row += [""] * 7
+                continue
+            mer = e["mer"] if e["mer"] > 0 else None
+            w = e["win"] or {}
+            row += [e["status"], f1(mer), tx(mer, L),
+                    "" if e.get("ber") is None else "%.2e" % e["ber"],
+                    w.get("packets", ""), w.get("corrected_packets", ""),
+                    w.get("uncorrectable", "")]
+        log_csv.writerow(row)
+        log_file.flush()
 
     def gr_blocks():
         """(label, block) of the running flowgraph: fixed part, spectrum/level
@@ -254,6 +313,12 @@ def main():
         print("[%6.1f s] %sTMCC ok %d bad %d | %s" % (el, rf_txt, dyn.frames_ok, dyn.frames_bad,
                                                      " | ".join(parts) or "no layer built"),
               flush=True)
+        if log_file is not None and el - state["last_log"] >= a.log_interval - 0.5:
+            state["last_log"] = el
+            try:
+                write_log(el, m)
+            except Exception as e:
+                print("CSV log error: %r" % (e,), flush=True)
         # stall watchdog (Rodada 54): TMCC frames stopped while the source runs
         cur = counters()
         if not a.iq and dyn.frames_ok + dyn.frames_bad == state["last_ok"] and state["last_ok"] > 0:
@@ -267,9 +332,10 @@ def main():
         state["counts"] = cur
         if a.duration and el >= a.duration:
             Qt.QApplication.quit()
-        # offline: finished when no TMCC frame arrived for 5 s
-        if a.iq and dyn.last_msg_time and time.time() - dyn.last_msg_time > 5 \
-                and dyn.pending is None:
+        # offline: finished when no TMCC frame arrived for 5 s (unless --duration
+        # was given: a file may hold long stretches without signal)
+        if a.iq and not a.duration and dyn.last_msg_time \
+                and time.time() - dyn.last_msg_time > 5 and dyn.pending is None:
             print("IQ file processed.")
             Qt.QApplication.quit()
 

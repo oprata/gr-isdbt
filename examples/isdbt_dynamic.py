@@ -47,6 +47,7 @@ except ImportError:                   # GNU Radio 3.9+
     from gnuradio import isdbt
 
 import epy_isdbt_mer
+import mer_cal
 import ts_rtp
 
 LAYER_NAMES = "ABC"
@@ -435,6 +436,43 @@ def _number_sink(title, vmin, vmax, unit=""):
     return s
 
 
+def _level_ok(mc):
+    # tolerate an older mer_cal.py without level_ok() (files copied out of step)
+    f = getattr(mc, "level_ok", None)
+    return f() if f is not None else True
+
+
+def mer_corrected_active():
+    mc = mer_cal.get()
+    return mc.show and mc.cal is not None and _level_ok(mc)
+
+
+def mer_suspended():
+    """Calibrated and enabled, but the level at the ADC changed."""
+    mc = mer_cal.get()
+    return mc.show and mc.cal is not None and not _level_ok(mc)
+
+
+def mer_header():
+    if mer_corrected_active():
+        return "MER (corrected)"
+    if mer_suspended():
+        return "MER (measured: level changed since calibration)"
+    return "MER"
+
+
+def mer_display(mer, key):
+    """Text of a MER value: the corrected value when the MER calibration is
+    active ("> X dB" near the receiver floor), otherwise the measured one."""
+    if mer is None:
+        return "-"
+    if mer_corrected_active():
+        _, txt = mer_cal.get().estimate(mer, key)
+        if txt:
+            return txt.lstrip("~")
+    return "%.1f dB" % mer
+
+
 class LayerGui(object):
     """Widgets of the analyzer (all texts in English).
 
@@ -465,15 +503,17 @@ class LayerGui(object):
         overview_layout.insertWidget(0, _wrap_widget(self.const))
         self.summary = Qt.QLabel("Waiting for a valid TMCC frame...")
         self.summary.setTextFormat(QtCore.Qt.RichText)
+        self.summary.setWordWrap(True)
         overview_layout.addWidget(self.summary)
         self.sinks = []
         self.panels = []
         for i, L in enumerate(LAYER_NAMES):
             panel = Qt.QLabel("")
             panel.setTextFormat(QtCore.Qt.RichText)
+            panel.setWordWrap(True)            # long notes must not widen the window
             panel.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
             layer_layouts[i].addWidget(panel)
-            mer = _number_sink("MER", 0, 40, "dB")
+            mer = _number_sink("MER (measured)", 0, 40, "dB")
             layer_layouts[i].addWidget(_wrap_widget(mer))
             self.panels.append(panel)
             self.sinks.append({"mer": mer})
@@ -558,6 +598,20 @@ class LayerGui(object):
             "<td style='padding-right:12px'>%s</td>" % c for c in cells)
 
     def _refresh(self):
+        try:
+            self._refresh_inner()
+        except Exception as e:                # report once per kind, keep the GUI alive
+            key = repr(e)
+            if key not in getattr(self, "_refresh_errors", set()):
+                self._refresh_errors = getattr(self, "_refresh_errors", set()) | {key}
+                import traceback
+                print("[dyn] display error (the analyzer keeps running): %s" % key, flush=True)
+                traceback.print_exc()
+                self.summary.setText("<span style='color:red'>Display error: %s - see the "
+                                     "terminal (are all .py files from the same version?)</span>"
+                                     % html_escape(key))
+
+    def _refresh_inner(self):
         if self.controller is None:
             return
         cfg = self.info.get("cfg")
@@ -567,7 +621,7 @@ class LayerGui(object):
         for k, v in enumerate(getattr(self, "viewers", [])):
             sink = self.controller.rtp_sinks[k]
             v.set_pat_inserted(bool(sink is not None and sink.injecting))
-        rows = [self._row(["Status", "Layer", "MER", "BER (10 s)", "Lost (10 s)",
+        rows = [self._row(["Status", "Layer", mer_header(), "BER (10 s)", "Lost (10 s)",
                            "Modulation", "Code rate", "Interleaving", "Segments"],
                           header=True)]
         for i, L in enumerate(LAYER_NAMES):
@@ -577,7 +631,7 @@ class LayerGui(object):
                 self.panels[i].setText("")
                 continue
             mod, cr, il, seg = self._params(lp)
-            mer = "%.1f dB" % e["mer"] if e["mer"] > 0 else "-"
+            mer = mer_display(e["mer"] if e["mer"] > 0 else None, L)
             status = "%s %s" % (self._dot(e["color"]), e["status"])
             ber = html_escape(e["ber_text"])
             lost = fmt_int(e["win"]["uncorrectable"]) if e["win"] else "-"
@@ -595,13 +649,13 @@ class LayerGui(object):
              self._row([mod, cr, il, seg]), "</table>"]
         if e["win"] is None:
             h += ["<p><b>Reception quality</b></p>", self.TABLE,
-                  self._row(["Status", "MER", "BER after Viterbi"], True),
+                  self._row(["Status", mer_header(), "BER after Viterbi"], True),
                   self._row([status, mer, ber]), "</table>"]
             return "".join(h)
         w, t = e["win"], e["total"]
         win_s = max(1, int(round(e["window_s"])))
         h += ["<p><b>Reception quality</b> - last %d s</p>" % win_s, self.TABLE,
-              self._row(["Status", "MER", "BER after Viterbi", "Corrected bits",
+              self._row(["Status", mer_header(), "BER after Viterbi", "Corrected bits",
                          "Corrected packets", "Lost packets"], True),
               self._row([status, mer, ber,
                          "%s of %s" % (fmt_int(w["corrected_bits"]), fmt_big(e["nbits"])),
@@ -622,7 +676,8 @@ class LayerGui(object):
                          "0 %" if t["uncorrectable"] == 0 else "%.3f %%" % loss]),
               "</table>",
               "<p style='color:gray'>Reference: BER after Viterbi &le; 2&times;10<sup>-4</sup>"
-              " &rarr; quasi error-free TS after Reed-Solomon. Updated %s</p>"
+              " &rarr; quasi error-free TS after Reed-Solomon. MER (corrected): "
+              "receiver floor removed (Control tab, MER calibration). Indicative values. Updated %s</p>"
               % time.strftime("%H:%M:%S")]
         return "".join(h)
 
@@ -662,6 +717,41 @@ def _knob_column(title, dial, value, info=None):
         v.addWidget(w, 0, QtCore.Qt.AlignHCenter)
     v.addStretch(1)
     return box
+
+
+def _half_db_knob(lo, hi, init, unit, size=170):
+    """QDial in 0.5 dB steps (wheel/arrow: 0.5 dB, PgUp/PgDn: 5 dB) with a big
+    value label below. Returns (dial, label, get_value)."""
+    from PyQt5 import Qt
+    dial = Qt.QDial()
+    dial.setRange(int(round(lo * 2)), int(round(hi * 2)))
+    dial.setSingleStep(1)
+    dial.setPageStep(10)
+    dial.setNotchesVisible(True)
+    dial.setWrapping(False)
+    dial.setFixedSize(size, size)
+    dial.setValue(int(round(init * 2)))
+    big = Qt.QFont()
+    big.setPointSize(big.pointSize() + 6)
+    big.setBold(True)
+    lab = Qt.QLabel()
+    lab.setFont(big)
+
+    def show(v):
+        lab.setText("%.1f %s" % (v / 2.0, unit))
+    dial.valueChanged.connect(show)
+    show(dial.value())
+    return dial, lab, (lambda: dial.value() / 2.0)
+
+
+def _buttons(*widgets):
+    from PyQt5 import Qt
+    w = Qt.QWidget()
+    h = Qt.QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    for b in widgets:
+        h.addWidget(b)
+    return w
 
 
 def _build_control_tab(tb, rf=None):
@@ -743,7 +833,8 @@ def _build_control_tab(tb, rf=None):
     row.addWidget(_knob_column("RX Gain", gain, gain_value))
     row.addSpacing(40)
     row.addWidget(_knob_column("Channel", chan, chan_value, chan_info))
-    row.addStretch(1)
+    row.addSpacing(40)
+    # the calibration reference knobs follow in the same row (same style)
 
     # Level calibration (rf_level.py): makes the channel power readable in dBm
     if rf is not None:
@@ -751,36 +842,31 @@ def _build_control_tab(tb, rf=None):
         g = Qt.QGridLayout(box)
         level = Qt.QLabel("Measuring the signal level...")
         level.setTextFormat(QtCore.Qt.RichText)
-        level.setSizePolicy(Qt.QSizePolicy.Ignored, Qt.QSizePolicy.Fixed)
+        level.setWordWrap(True)
         cal_info = Qt.QLabel(rf.cal_text())
         cal_info.setStyleSheet("color: gray")
+        cal_info.setWordWrap(True)
         steps = Qt.QLabel(
             "The LimeSDR measures the signal only relative to its converter (dBFS). "
             "To show it in dBm it needs one reference:<br>"
             "<b>1.</b> Feed the LimeSDR with a signal of known level - e.g. the modulator: "
             "its output level minus the loss of cables and attenuators.<br>"
-            "<b>2.</b> Type that level below.<br>"
+            "<b>2.</b> Turn the <b>Level reference</b> knob to that level.<br>"
             "<b>3.</b> Press <b>Calibrate</b>. From then on the channel power is shown in dBm "
             "(here and in the Spectrum tab). The calibration is saved and stays valid "
             "when the RX Gain changes; repeat it if you change the LimeSDR, the antenna "
             "port or the band.")
         steps.setTextFormat(QtCore.Qt.RichText)
         steps.setWordWrap(True)
-        ref = Qt.QDoubleSpinBox()
-        ref.setRange(-130.0, 20.0)
-        ref.setDecimals(1)
-        ref.setSingleStep(0.5)
-        ref.setSuffix(" dBm")
-        ref.setValue(rf.cal.get("reference_dbm", -40.0) if rf.cal else -40.0)
+        ref_dial, ref_lab, ref_value = _half_db_knob(
+            -130.0, 20.0, rf.cal.get("reference_dbm", -40.0) if rf.cal else -40.0, "dBm")
         btn = Qt.QPushButton("Calibrate")
-        clr = Qt.QPushButton("Clear calibration")
-        g.addWidget(steps, 0, 0, 1, 4)
-        g.addWidget(Qt.QLabel("Known level at the LimeSDR input:"), 1, 0)
-        g.addWidget(ref, 1, 1)
-        g.addWidget(btn, 1, 2)
-        g.addWidget(clr, 1, 3)
-        g.addWidget(level, 2, 0, 1, 4)
-        g.addWidget(cal_info, 3, 0, 1, 4)
+        clr = Qt.QPushButton("Clear")
+        row.addWidget(_knob_column("Level reference", ref_dial, ref_lab, _buttons(btn, clr)))
+        row.addSpacing(40)
+        g.addWidget(steps, 0, 0)
+        g.addWidget(level, 1, 0)
+        g.addWidget(cal_info, 2, 0)
         outer.addWidget(box)
 
         def level_text():
@@ -795,7 +881,7 @@ def _build_control_tab(tb, rf=None):
 
         def do_cal():
             try:
-                rf.calibrate(ref.value())
+                rf.calibrate(ref_value())
             except Exception as e:
                 cal_info.setText("Calibration failed: %s" % e)
                 return
@@ -816,18 +902,126 @@ def _build_control_tab(tb, rf=None):
         level_timer.timeout.connect(refresh_level)
         level_timer.start(1000)
         tb._dyn_level_timer = level_timer
+    # MER calibration: receiver floor per layer -> estimated transmitter MER
+    mc = mer_cal.get()
+    mbox = Qt.QGroupBox("MER calibration (transmitter estimate)")
+    mg = Qt.QGridLayout(mbox)
+    msteps = Qt.QLabel(
+        "The receiver adds its own error, so the measured MER stays near ~32 dB even when "
+        "the transmitter is better. To show an estimate of the transmitter MER:<br>"
+        "<b>1.</b> With the transmitter in a known state, turn the <b>MER reference</b> knob to "
+        "its MER (exciter display or a reference analyzer).<br>"
+        "<b>2.</b> Press <b>Calibrate</b>: the receiver floor of each layer is computed from the "
+        "MER measured now.<br>"
+        "<b>3.</b> From then on every MER shown (layers, Constellation, Spectrum) is the "
+        "<b>corrected</b> value: it follows the transmitter as it changes. Only when the "
+        "transmitter is better than the receiver can resolve it shows \"&gt; xx dB\". "
+        "Keep the RX Gain fixed after calibrating: if the channel power at the ADC moves more "
+        "than 4 dB from the calibration level, the correction is suspended and the measured "
+        "MER is shown.")
+    msteps.setTextFormat(QtCore.Qt.RichText)
+    msteps.setWordWrap(True)
+    mref_dial, mref_lab, mref_value = _half_db_knob(
+        20.0, 60.0, (mc.cal or {}).get("reference_tx_mer_db", 40.0), "dB")
+    mbtn = Qt.QPushButton("Calibrate")
+    mclr = Qt.QPushButton("Clear")
+    mshow = Qt.QCheckBox("Show corrected MER (unchecked: show the measured MER)")
+    mshow.setChecked(mc.show)
+    mnow = Qt.QLabel("")
+    mnow.setTextFormat(QtCore.Qt.RichText)
+    mnow.setWordWrap(True)
+    minfo = Qt.QLabel(mc.text())
+    minfo.setStyleSheet("color: gray")
+    minfo.setWordWrap(True)
+    row.addWidget(_knob_column("MER reference", mref_dial, mref_lab, _buttons(mbtn, mclr)))
+    row.addStretch(1)
+    mg.addWidget(msteps, 0, 0)
+    mg.addWidget(mshow, 1, 0)
+    mg.addWidget(mnow, 2, 0)
+    mg.addWidget(minfo, 3, 0)
+    outer.addWidget(mbox)
+
+    def measured_mers():
+        dyn = getattr(tb, "_dyn_controller", None)
+        if dyn is None:
+            return {}
+        out = {}
+        for L, e in dyn.metrics().items():
+            if e.get("mer", 0) > 0:
+                out[L] = e["mer"]
+        tot = dyn.total_mer()
+        if tot is not None:
+            out["total"] = tot
+        return out
+
+    def mer_now_text():
+        m = measured_mers()
+        if not m:
+            return "MER now: -"
+        parts = []
+        for k in mer_cal.KEYS:
+            if k in m:
+                _, est = mc.estimate(m[k], k)
+                name = "all layers" if k == "total" else "layer " + k
+                if est:
+                    parts.append("%s %.1f &rarr; <b>%s</b>" % (name, m[k], est.lstrip("~")))
+                else:
+                    parts.append("%s <b>%.1f dB</b>" % (name, m[k]))
+        head = ("MER now (measured &rarr; corrected): " if mer_corrected_active() else
+                "MER now (measured - correction suspended, level changed): " if mer_suspended()
+                else "MER now (measured): ")
+        return head + " &nbsp;|&nbsp; ".join(parts)
+
+    def do_mcal():
+        try:
+            g = float(tb.get_rx_gain())
+        except Exception:
+            g = None
+        try:
+            mc.calibrate(measured_mers(), mref_value(), g)
+        except ValueError as e:
+            minfo.setText("Calibration failed: %s" % e)
+            return
+        minfo.setText(mc.text())
+        mnow.setText(mer_now_text())
+
+    def do_mclear():
+        mc.clear()
+        minfo.setText(mc.text())
+        mnow.setText(mer_now_text())
+    mbtn.clicked.connect(do_mcal)
+    mclr.clicked.connect(do_mclear)
+    mshow.toggled.connect(lambda f: (mc.set_show(f), mnow.setText(mer_now_text())))
+
+    def refresh_mer():
+        if page.isVisible():
+            mnow.setText(mer_now_text())
+            try:
+                minfo.setText(mc.text())
+            except Exception as e:
+                minfo.setText("MER calibration: %r" % (e,))
+    mer_timer = QtCore.QTimer()
+    mer_timer.timeout.connect(refresh_mer)
+    mer_timer.start(1000)
+    tb._dyn_mer_timer = mer_timer
     outer.addStretch(1)
 
     # put it in the 'Control' tab of the .grc if there is one, else create it
+    # vertical scrolling only; the texts wrap to the window width
+    scroll = Qt.QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+    scroll.setFrameShape(Qt.QFrame.NoFrame)
+    scroll.setWidget(page)
     idx = next((i for i in range(tabs.count()) if tabs.tabText(i) == "Control"), None)
     if idx is None:
-        tabs.addTab(page, "Control")
+        tabs.addTab(scroll, "Control")
     else:
         lay = getattr(tb, "tab_widget_layers_layout_%d" % idx, None)
         if lay is not None:
-            lay.insertWidget(0, page, 100)    # on top, taking the space of the hidden GRC widgets
+            lay.insertWidget(0, scroll, 100)  # on top, taking the space of the hidden GRC widgets
         else:
-            tabs.addTab(page, "Control")
+            tabs.addTab(scroll, "Control")
     tb._dyn_control = (page, gain, chan)       # keep references
 
 
@@ -849,6 +1043,7 @@ def gui_from_generated(tb):
     try:
         rf = rf_level.RfLevel(tb, tb.limesdr_source_0, tb.low_pass_filter_0, float(tb.samp_rate))
         tb._rf_level = rf
+        mer_cal.get().level_fn = lambda: rf.reading()["chan_dbfs"]
     except Exception as e:
         print("[dyn] RF level not available: %r" % (e,), flush=True)
     try:

@@ -80,6 +80,9 @@ namespace gr {
                 int d_failed_acq;
                 double d_last_resync_msg;
                 long d_resyncs;
+                long d_fail_samples;     // input consumed since the last successful symbol
+                float d_last_peak;       // last lambda peak seen by peak_detect_process()
+                long d_detector_resets;
 
                 int d_consumed; 
                 int d_out; 
