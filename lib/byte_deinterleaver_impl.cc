@@ -76,7 +76,9 @@ namespace gr {
          */
         byte_deinterleaver_impl::~byte_deinterleaver_impl()
         {
-            for (unsigned int i = 0; i < d_shift.size(); i++)
+            // (the former for (i < d_shift.size()) loop with pop_back() freed
+            // only half of the buffers: size shrinks while i grows)
+            while (!d_shift.empty())
             {
                 delete d_shift.back();
                 d_shift.pop_back();

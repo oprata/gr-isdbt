@@ -731,6 +731,8 @@ namespace gr {
          */
         tmcc_decoder_impl::~tmcc_decoder_impl()
         {
+            delete[] d_data_carriers;
+            delete[] d_prev_tmcc_symbol;
         }
 
         void

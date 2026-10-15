@@ -42,6 +42,7 @@
 //for debugging 
 #include <ctime>
 #include <cstdlib>
+#include <cstring>
 
 namespace gr {
     namespace isdbt {
@@ -191,6 +192,13 @@ namespace gr {
 
                   d_previous_channel_gain = (gr_complex *)volk_malloc(d_active_carriers*sizeof(gr_complex), d_align); 
                   d_delta_channel_gains = (gr_complex *)volk_malloc(d_active_carriers*sizeof(gr_complex), d_align); 
+                  // volk_malloc does not initialise: the first estimate_fine_synchro()
+                  // after construction compared the first symbol with garbage (and a
+                  // NaN there would stick in d_fine_freq). Start from zero.
+                  memset(d_channel_gain, 0, d_active_carriers*sizeof(gr_complex));
+                  memset(d_previous_channel_gain, 0, d_active_carriers*sizeof(gr_complex));
+                  memset(d_delta_channel_gains, 0, d_active_carriers*sizeof(gr_complex));
+                  memset(d_channel_gain_inv, 0, d_active_carriers*sizeof(gr_complex));
                   d_samp_inc = 1; 
                   d_est_delta = 0;
                   d_delta_aux = 0;

@@ -158,6 +158,10 @@ namespace gr {
          */
         bit_deinterleaver_impl::~bit_deinterleaver_impl()
         {
+            while (!d_shift.empty()) {
+                delete d_shift.back();
+                d_shift.pop_back();
+            }
         }
 
         /*

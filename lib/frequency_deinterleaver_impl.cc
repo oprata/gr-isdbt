@@ -121,6 +121,8 @@ namespace gr {
          */
         frequency_deinterleaver_impl::~frequency_deinterleaver_impl()
         {
+            delete[] d_not_random;
+            delete[] d_derotated;
         }
         
         /* The idea is the following. We have to derandomize each segment. These symbols are outputted from the randomizer
