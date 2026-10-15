@@ -218,6 +218,7 @@ class ts_rtp_sink(gr.sync_block):
         self.min_offset = None               # min(PTS - t) seen before anchoring
         self.anchor = None                   # PCR(t) = anchor + t
         self.pcr_discontinuity = False       # flag the next PCR after a re-anchor
+        self.pcr_passthrough = False         # no PTS yet after 1.5 s: send as is, keep looking
         self.reanchors = 0
         self.pcr_rewritten = 0
         # pacing
@@ -308,7 +309,7 @@ class ts_rtp_sink(gr.sync_block):
             now = time.monotonic()
             dt = now - last
             last = now
-            if rate <= 0 or (self.pcr_restamp and self.anchor is None):
+            if rate <= 0 or self._waiting_anchor():
                 # rate (or PCR anchor) not known yet (first ~1 s after start /
                 # rebuild): hold the data (pre-buffer) instead of guessing
                 time.sleep(step)
@@ -379,13 +380,16 @@ class ts_rtp_sink(gr.sync_block):
         self._measure_rate(n, time.monotonic())
         with self.cond:
             self.queue.extend(out)
-            holding = self.rate <= 0 or (self.pcr_restamp and self.anchor is None)
+            holding = self.rate <= 0 or self._waiting_anchor()
             limit = 400000 if holding else max(4000, int(self.rate * self.max_queue_s))
             while len(self.queue) > limit:   # sender cannot keep up: drop oldest
                 self.queue.popleft()
                 self.dropped += 1
             self.cond.notify()
         return n
+
+    def _waiting_anchor(self):
+        return self.pcr_restamp and self.anchor is None and not self.pcr_passthrough
 
     def _track_pts(self, pk, base_idx):
         """Anchor (and, if the content jumps, re-anchor) the regenerated PCR
@@ -410,10 +414,15 @@ class ts_rtp_sink(gr.sync_block):
                     self.reanchors += 1
         if self.anchor is None:
             elapsed = self.pkt_index / self.pkt_rate
-            if self.min_offset is not None and elapsed >= 0.8:
+            if self.min_offset is not None and (elapsed >= 0.8 or self.pcr_passthrough):
                 self.anchor = self.min_offset - self.pcr_margin
-            elif elapsed >= 1.5:                  # no PTS at all: leave the PCR alone
-                self.pcr_restamp = False
+                if self.pcr_passthrough:          # PCR changes from original to regenerated
+                    self.pcr_discontinuity = True
+            elif elapsed >= 1.5 and not self.pcr_passthrough:
+                # no PTS yet (seen live once at start-up: "PCR rewritten 0" for the whole
+                # run): send the stream unchanged meanwhile, but keep looking for a PTS
+                # instead of giving up on the regenerated PCR for good
+                self.pcr_passthrough = True
 
     def _restamp(self, payload, idx0, rows):
         if not rows or idx0 is None or not self.pcr_restamp or self.anchor is None:
