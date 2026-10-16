@@ -167,8 +167,9 @@ namespace gr {
                 const unsigned char *in = (const unsigned char *) input_items[0];
                 unsigned char *out = (unsigned char *) output_items[0];
 
-                float *ber_out = (float *) output_items[1]; 
-                bool ber_out_connected  = output_items.size()>=2;  
+                // output 1 (BER) is optional: do not read past output_items
+                bool ber_out_connected  = output_items.size()>=2;
+                float *ber_out = ber_out_connected ? (float *) output_items[1] : nullptr;
 
                 int j = 0; 
                 int k = 0; 

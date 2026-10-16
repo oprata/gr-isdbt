@@ -152,8 +152,9 @@ namespace gr {
             {
                 const gr_complex *in = (const gr_complex *) input_items[0];
 				unsigned char *out_A = (unsigned char *) output_items[0];
-				unsigned char *out_B = (unsigned char *) output_items[1];
-				unsigned char *out_C = (unsigned char *) output_items[2];
+				// outputs B and C are optional (absent layers): do not read past output_items
+				unsigned char *out_B = output_items.size()>=2 ? (unsigned char *) output_items[1] : nullptr;
+				unsigned char *out_C = output_items.size()>=3 ? (unsigned char *) output_items[2] : nullptr;
 				//printf("%d\t %d\t %d\n",  d_nsegments_A*d_carriers_per_segment, (d_nsegments_A + d_nsegments_B)*d_carriers_per_segment, (d_nsegments_A + d_nsegments_B+ d_nsegments_C)*d_carriers_per_segment);
 
                 bool out_B_connected = output_items.size()>=2;

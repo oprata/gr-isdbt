@@ -645,8 +645,9 @@ namespace gr {
                     int nblocks = 8 * noutput_items / (d_bsize * d_k);
                     int out_count = 0;
 
-                    float *ber_out = (float *)output_items[1]; 
-                    bool ber_out_connected = output_items.size()>=2; 
+                    // output 1 (BER) is optional: do not read past output_items
+                    bool ber_out_connected = output_items.size()>=2;
+                    float *ber_out = ber_out_connected ? (float *)output_items[1] : nullptr;
                     int correct_bits = 0; 
 
                     for (int m = 0; m < nstreams; m++) {
